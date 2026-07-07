@@ -1,0 +1,1 @@
+It gives you sockets that carry atomic messages across various transports like in-process, inter-process, TCP, and multicast.
