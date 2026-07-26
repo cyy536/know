@@ -1,0 +1,1 @@
+.dmg（Disk Image）类似一个压缩后的 U 盘镜像，双击后系统会把它挂载成一个临时磁盘，拖到 Applications 是复制过去

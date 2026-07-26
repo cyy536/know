@@ -86,8 +86,6 @@ overlap.o -o overlap \
 ## gdb
 
 ```
-gdb -p PID1
-
 gdb -ex "break aclnnGroupedMatmul" \
     -ex "break aclnnGroupedMatmulV2" \
     -ex "break aclnnGroupedMatmulV3" \
@@ -96,18 +94,26 @@ gdb -ex "break aclnnGroupedMatmul" \
     -ex "run" \
     --args python example1.py
 
+gdb -p PID1
+需要cap_sys_ptrace
+
 backtrace
 break test.c:10 if i >= 100 
 continue
+Ctrl+C:暂停正在运行的被调试程序
 delete 2
 delete break
 finish
 info breakpoints
+info threads
 list
 next
+run:控制权交给被调试程序
 step
 set scheduler-locking on
 GDB will only allow the current thread to run when the program is resumed (e.g., with continue, next, or step commands). All other threads are held stopped by the operating system's scheduler. 
+thread apply 68 bt
+线程68的调用栈
 ```
 
 操作系统在程序发生异常而异常在进程内部又没有被捕获的情况下，会把进程此刻内存、寄存器状态、运行堆栈等信息转储保存在一个文件里。
@@ -508,6 +514,12 @@ VLOG(3) << "IsTimeout: " << IsTimeout();
 # python
 
 C实现的
+
+```
+apt install -y python3.11
+apt install -y python3.11-dev
+Python C 头文件
+```
 
 ## 对象
 
@@ -946,6 +958,10 @@ PyCodeObject 执行后不会销毁，会被模块对象保留，且可通过 .py
 如果循环导入中依赖了未执行的内容，会直接报错。
 ```
 
+```
+(function, *args, use_reentrant=None, context_fn=<function noop_context_fn>, determinism_check='default', debug=False, early_stop=True, **kwargs)
+*args后面的参数是 keyword-only 参数
+```
 ## 模块
 
 module查找：sys.modules，builtin（编译进解释器），sys.path（当前目录，PYTHONPATH，python安装路径，site-packages）
@@ -1031,6 +1047,10 @@ def 上下文函数():
     except x:
         pass
     exit()
+```
+
+```
+python -c "import sys; print(int(sys.argv[1])/1024/1024/1024,\"GiB\")" `cat /sys/fs/cgroup/memory/memory.usage_in_bytes`
 ```
 
 ## pip
@@ -1470,12 +1490,18 @@ print("解析后的类型：", type_hints["sequence_parallel_nccl_config"])
 # 输出：解析后的类型： typing.Optional[typing.Dict[str, typing.Dict[str, int]]]
 ```
 
+## functools
+
+@lru_cache 对函数的返回值进行缓存。相同参数再次调用时，直接返回之前计算的结果，不重新执行函数。
+
 ## logging
+
+根 logger 是最顶层（logging.getLogger() 无参数时获取）；子 logger 按 “点分隔” 命名（比如 logging.getLogger("a.b") 是 logging.getLogger("a") 的子级，a 又是根 logger 的子级）；默认情况下，子 logger 输出日志时，会把日志消息向上传播给父级 logger，父级再按自己的配置处理。
 
 ```
 logger = logging.getLogger("strobelight_function_profiler")
 
-console_handler = logging.StreamHandler()
+console_handler = logging.StreamHandler(sys.stdout)
 formatter = logging.Formatter(
     "%(name)s, line %(lineno)d, %(asctime)s, %(levelname)s: %(message)s"
 )
@@ -1484,14 +1510,7 @@ console_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.setLevel(logging.INFO)
 logger.propagate = False
-#阻止当前 logger 的日志消息向上传递给父级 logger
 ```
-
-根 logger 是最顶层（logging.getLogger() 无参数时获取）；
-
-子 logger 按 “点分隔” 命名（比如 logging.getLogger("a.b") 是 logging.getLogger("a") 的子级，a 又是根 logger 的子级）；
-
-默认情况下，子 logger 输出日志时，会把日志消息向上传播给父级 logger，父级再按自己的配置处理（比如输出到控制台 / 文件）。
 
 warnings 模块发出的警告，默认输出到标准错误流（stderr）
 
@@ -1701,7 +1720,13 @@ group(1)返回第1组
 print("全部参数：", sys.argv)
 print("脚本名：", sys.argv[0])
 ```
+## traceback
 
+```
+def patch_fn(*args,**kwargs):
+    print("".join(traceback.format_stack()))
+fn=patch_fn
+```
 ## typing
 
 ```
@@ -1760,8 +1785,8 @@ done
 ```
 
 ```
-'...'   几乎完全原样，不展开变量，不执行命令
 "..."   保留空格，但会展开变量和命令替换
+'...'   不展开变量，不执行命令，不转义
 $(...)  命令替换：执行命令，把输出放回来
 `...`   老式命令替换
 ```
@@ -1874,7 +1899,7 @@ miniforge: conda(默认从conda-forge下载), mamba(cpp版本)
 PyTorch 的 Conda 包在构建时主动包含 Pip 格式的元数据，pip show 有效
 ```
 
-通过pip install，libcudart会安装在torch/lib
+通过pip install，libcudart, libnccl会安装在torch/lib
 
 ```
 /opt/conda/envs/myenv/              

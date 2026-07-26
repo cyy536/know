@@ -1,3 +1,26 @@
+# optimizer
+
+sgd: θt+1​=θt​−ηgt​
+
+adam 不只看当前梯度，也记住过去梯度趋势
+
+方向：mt​=β1​mt−1​+(1−β1​)gt
+
+步长：vt​=β2​vt−1​+(1−β2​)gt^2​
+
+θt+1​=θt​−ηmt/sqrt(vt)
+
+adam 把每个元素独立处理，muon 整个矩阵 G 作为一个整体处理
+
+Mt​=βMt−1​+(1−β)Gt​
+
+保持方向，去掉大小：M=UΣV^T, O=UV^T
+
+计算O用Newton-Schulz近似（矩阵乘法）
+
+Wt+1​=Wt​−ηOt​
+
+分布式：gather(M)，compute_O，scatter(O)，不同GPU负载不同矩阵的完整计算
 # sample
 
 ```
@@ -419,9 +442,6 @@ batch size不能无限增大：时延要求，显存限制 (KV)
 # deepseek
 
 ```
-https://zhuanlan.zhihu.com/p/27777601573
-DeepEP provides high-throughput and low-latency all-to-all GPU kernels
-通信库，训练和推理都能用
 让专家最多分布在M个设备中，在每次选择Topk之前，先对筛选出M个有着最高亲和性的设备
 deepseek则通过给门控激活值引入bias item来实现负载均衡与模型性能之间的平衡
 EPLB采用了 “冗余专家” 策略，即复制高负载的专家，然后将这些复制后的专家合理分配到各个 GPU 上，以实现负载均衡。

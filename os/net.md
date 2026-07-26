@@ -674,7 +674,9 @@ v2rayN 和 v2rayNG 使用 Xray 内核
 mihomo (Clash Meta) 自动选最快节点，主要做客户端代理内核
 
 ```
-./mihomo-linux-amd64-v2-v1.19.24 -f config.yaml
+curl -L https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb -o geoip.metadb
+curl -L https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat -o geosite.dat
+./mihomo-linux-amd64-v2-v1.19.24 -f config.yaml -d .
 ```
 
 clash-verge-rev, ClashMetaForAndroid

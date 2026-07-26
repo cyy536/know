@@ -1,3 +1,9 @@
+Caffe2的GitHub仓库直接并入PyTorch主库
+
+c10(caffe2):tensor and storage struct
+
+aten(a tensor library):tensor operator
+
 ```
 AMD->ROCm, Intel->Intel oneAPI 都被pytorch支持。
 ROCm 类似于 NVIDIA 的 CUDA 平台（包含编译器、库、工具等整个生态）。
@@ -74,17 +80,19 @@ https://github.com/pytorch/pytorch/blob/main/torch/multiprocessing/reductions.py
 rebuild_cuda_tensor()
 ```
 
+# build
+
+3090, 570.195.03, 12.8
+
+至少30GiB内存
+
 ```
-docker pull nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04
-docker run -itd --ipc host --net host --gpus all --name cyy_torch -v ~/torch:/torch nvcr.io/nvidia/cuda:12.8.1-cudnn-devel-ubuntu24.04 bash
-apt install -y python3.11
-apt install -y python3.11-dev
-git clone https://github.com/pytorch/pytorch
+git clone https://github.com/pytorch/pytorch.git
 cd pytorch
-git checkout v.2.10.0
+git checkout v2.13.0
 git submodule sync
 git submodule update --init --recursive
-DEBUG=1 MAX_JOBS=16 nohup python -m pip install --no-build-isolation -v -e . > cyyinstall.log 2>&1 &
+DEBUG=1 MAX_JOBS=1 nohup python -m pip install --no-build-isolation -v -e . > cyyinstall.log 2>&1 &
 python setup.py clean
 ```
 
@@ -173,10 +181,468 @@ def _preload_cuda_lib(lib_folder: str, lib_name: str, required: bool = True) -> 
         ctypes.CDLL(lib_path)
 ```
 
+# aten/src/ATen
+
+op 会 dispatch 多次，嵌套 autograd，TorchDispatchMode，cuda
+
+## core
+### boxing
+#### BoxedKernel_impl.h
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel
+
+```
+inline void BoxedKernel::callBoxed(
+    const OperatorHandle& opHandle,
+    DispatchKeySet dispatchKeySet,
+    Stack* stack) const {
+  (*boxed_kernel_func_)(functor_.get(), opHandle, dispatchKeySet, stack);
+```
+#### impl
+##### boxing.h
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper
+```
+struct BoxedKernelWrapper<
+    Result(Args...),
+    std::enable_if_t<
+        can_box_all<Args...>::value && can_unbox<Result>::value &&
+            !is_tuple_of_mutable_tensor_refs<Result>::value,
+        void>> {
+  static Result call(
+      const BoxedKernel& boxed_kernel_func,
+      const OperatorHandle& opHandle,
+      DispatchKeySet dispatchKeySet,
+      Args... args) {
+    torch::jit::Stack stack = boxArgs<Args...>(std::forward<Args>(args)...);
+    boxed_kernel_func.callBoxed(opHandle, dispatchKeySet, &stack);
+
+
+```
+
+##### make_boxed_from_unboxed_functor.h
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed
+```
+template <class KernelFunctor, bool AllowDeprecatedTypes>
+struct make_boxed_from_unboxed_functor final {
+  static void call(
+      OperatorKernel* functor,
+      const OperatorHandle& /*unused*/,
+      DispatchKeySet dispatchKeySet,
+      Stack* stack) {
+      ReturnType_ output = call_functor_with_args_from_stack<
+          KernelFunctor,
+          AllowDeprecatedTypes>(functor, dispatchKeySet, stack);
+
+call_functor_with_args_from_stack(
+    OperatorKernel* functor,
+    DispatchKeySet dispatchKeySet,
+    Stack* stack) {
+  using ArgTypes = typename c10::remove_DispatchKeySet_arg_from_func<
+      Functor>::parameter_types;
+  constexpr size_t num_ivalue_args = guts::typelist::size<ArgTypes>::value;
+  return call_functor_with_args_from_stack_<Functor, AllowDeprecatedTypes>(
+      functor,
+      dispatchKeySet,
+      stack,
+      std::make_index_sequence<num_ivalue_args>(),
+      static_cast<ArgTypes*>(nullptr));
+}
+
+call_functor_with_args_from_stack_(
+    OperatorKernel* functor,
+    DispatchKeySet dispatchKeySet,
+    Stack* stack,
+    std::index_sequence<ivalue_arg_indices...> /*unused*/,
+    guts::typelist::typelist<ArgTypes...>* /*unused*/) {
+  return wrap_kernel_functor_unboxed<Functor>::call(
+      functor,
+      dispatchKeySet,
+      ivalue_to_arg<
+          typename decay_if_not_tensor<ArgTypes>::type,
+          AllowDeprecatedTypes>::
+          call(torch::jit::peek(
+              *stack, ivalue_arg_indices, sizeof...(ivalue_arg_indices)))...);
+}
+
+struct wrap_kernel_functor_unboxed_<
+  static ReturnType call(
+      OperatorKernel* functor,
+      DispatchKeySet /*unused*/,
+      ParameterTypes... args) {
+    KernelFunctor* functor_ = static_cast<KernelFunctor*>(functor);
+    // Note [Plumbing Keys Through The Dispatcher 2]
+    // See Note [Plumbing Keys Through The Dispatcher] for the background.
+    // This functor explicitly takes in a dispatchKeySet and drops it on the
+    // floor- it does not forward it to the registered kernel.
+    //
+    // This is due to the calling convention within the dispatcher, which
+    // expects all registered kernels to have a first argument of type
+    // DispatchKeySet.
+    // This is not the case for pretty much all manually written kernels,
+    // however- this functor serves to separate the calling convention of the
+    // dispatcher from the calling convention of manually written kernels.
+    return (*functor_)(std::forward<ParameterTypes>(args)...);
+  }
+```
+##### WrapFunctionIntoFunctor.h
+```
+class WrapFunctionIntoFunctor_<
+    FuncPtr,
+    ReturnType,
+    guts::typelist::typelist<Parameters...>>
+    final : public c10::OperatorKernel {
+ public:
+  C10_ALWAYS_INLINE decltype(auto) operator()(Parameters... args) {
+    return (*FuncPtr::func_ptr())(std::forward<Parameters>(args)...);
+  }
+};
+} // namespace detail
+```
+#### KernelFunction_impl.h
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->callBoxed
+```
+C10_ALWAYS_INLINE Return KernelFunction::call(
+    const OperatorHandle& opHandle,
+    DispatchKeySet dispatchKeySet,
+    Args... args) const {
+  return impl::BoxedKernelWrapper<Return(Args...)>::call(
+      boxed_kernel_func_,
+      opHandle,
+      dispatchKeySet,
+      std::forward<Args>(args)...);
+
+inline void KernelFunction::callBoxed(
+    const OperatorHandle& opHandle,
+    DispatchKeySet dispatchKeySet,
+    Stack* stack) const {
+  boxed_kernel_func_.callBoxed(opHandle, dispatchKeySet, stack);
+}
+
+```
+### dispatch
+#### Dispatcher.h
+根据输入生成dispatchKeySet，选KernelFunction
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...
+```
+class TypedOperatorHandle<Return(Args...)> final : public OperatorHandle {
+  C10_ALWAYS_INLINE Return call(Args... args) const {
+    return c10::Dispatcher::singleton().call<Return, Args...>(
+        *this, std::forward<Args>(args)...);
+  }
+  C10_ALWAYS_INLINE Return
+  redispatch(DispatchKeySet currentDispatchKeySet, Args... args) const {
+    return c10::Dispatcher::singleton().redispatch<Return, Args...>(
+        *this, currentDispatchKeySet, std::forward<Args>(args)...);
+  }
+
+C10_ALWAYS_INLINE_UNLESS_MOBILE Return Dispatcher::call(
+    const TypedOperatorHandle<Return(Args...)>& op,
+    Args... args) const {
+  auto dispatchKeySet =
+      op.operatorDef_->op.dispatchKeyExtractor()
+          .template getDispatchKeySetUnboxed<Args...>(args...);
+  if (show_dispatch_trace()) {
+    detail::_print_dispatch_trace(
+        "[call]", toString(op.operator_name()), dispatchKeySet);
+  }
+  const KernelFunction& kernel = op.operatorDef_->op.lookup(dispatchKeySet);
+  return kernel.template call<Return, Args...>(
+      op, dispatchKeySet, std::forward<Args>(args)...);
+
+inline void Dispatcher::redispatchBoxed(
+    const OperatorHandle& op,
+    DispatchKeySet dispatchKeySet,
+    Stack* stack) const {
+  if (show_dispatch_trace()) {
+    detail::_print_dispatch_trace(
+        "[redispatchBoxed]", toString(op.operator_name()), dispatchKeySet);
+  const auto& kernel = entry.lookup(dispatchKeySet);
+  kernel.callBoxed(op, dispatchKeySet, stack);
+
+inline Return Dispatcher::redispatch(
+  return kernel.template call<Return, Args...>(
+      op, currentDispatchKeySet, std::forward<Args>(args)...);
+
+class TORCH_API OperatorHandle {
+  void redispatchBoxed(DispatchKeySet ks, Stack* stack) const {
+    c10::Dispatcher::singleton().redispatchBoxed(*this, ks, stack);
+  }
+
+```
+#### Dispatcher.cpp
+```
+ [call] op=[aten::matmul], key=[PythonTLSSnapshot]
+  [redispatchBoxed] op=[aten::matmul], key=[AutogradCUDA]
+   [call] op=[aten::mm], key=[PythonTLSSnapshot]
+    [redispatchBoxed] op=[aten::mm], key=[AutogradCUDA]
+     [redispatch] op=[aten::mm], key=[Python]
+      [callBoxed] op=[aten::mm], key=[CUDA]
+      [call] op=[aten::detach], key=[ADInplaceOrView]
+       [redispatch] op=[aten::detach], key=[CUDA]
+bool show_dispatch_trace() {
+  static auto envar = c10::utils::get_env("TORCH_SHOW_DISPATCH_TRACE");
+```
+### PythonFallbackKernel.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot
+
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...->pythonFallback
+```
+TORCH_LIBRARY_IMPL(_, PythonTLSSnapshot, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&pythonTLSSnapshotFallback>());
+}
+
+void pythonTLSSnapshotFallback(const c10::OperatorHandle &op, c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack) {
+  at::impl::MaybeSetTLSOnEntryGuard guard;
+
+  op.redispatchBoxed(dispatch_keys & c10::DispatchKeySet(c10::DispatchKeySet::FULL_AFTER, c10::DispatchKey::PythonTLSSnapshot), stack);
+}
+
+TORCH_LIBRARY_IMPL(_, Python, m) {
+  m.fallback(torch::CppFunction::makeFromBoxedFunction<&pythonFallback>());
+}
+
+void pythonFallback(const c10::OperatorHandle& op, c10::DispatchKeySet dispatch_keys, torch::jit::Stack* stack) {
+  const auto mode_stack_len = c10::impl::TorchDispatchModeTLS::stack_len();
+  if (mode_stack_len > 0) {
+    RECORD_FUNCTION("PythonDispatchMode", torch::jit::last(*stack, num_arguments));
+    const auto& cur_torch_dispatch_mode_state = c10::impl::TorchDispatchModeTLS::get_stack_at(mode_stack_len - 1);
+    cur_torch_dispatch_mode_state->pyinterpreter()->dispatch(op, stack);
+    return;
+  }
+
+```
+### TensorBody.h
+torch.matmul->Tensor::matmul
+
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...
+```
+inline at::Tensor Tensor::matmul(const at::Tensor & other) const {
+    return at::_ops::matmul::call(const_cast<Tensor&>(*this), other);
+}
+
+inline at::Tensor Tensor::mm(const at::Tensor & mat2) const {
+    return at::_ops::mm::call(const_cast<Tensor&>(*this), mat2);
+}
+```
+## native
+###　LinearAlgebra.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl
+```
+Tensor matmul(const Tensor & tensor1, const Tensor & tensor2) {
+  at::Tensor result, unused;
+  result = at::native::_matmul_impl(unused, tensor1, tensor2);
+  return result;
+}
+
+static Tensor _matmul_impl(
+    return has_out ? at::mm_out(out, tensor1, tensor2) : tensor1.mm(tensor2);
+
+```
+## Operators_3.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch
+
+```
+at::Tensor mm::redispatch(c10::DispatchKeySet dispatchKeySet, const at::Tensor & self, const at::Tensor & mat2) {
+
+    static auto op = create_mm_typed_handle();
+    return op.redispatch(dispatchKeySet, self, mat2);
+}
+```
+## Operators_4.cpp
+torch.matmul->Tensor::matmul->matmul::call
+```
+static C10_NOINLINE c10::TypedOperatorHandle<matmul::schema> create_matmul_typed_handle() {
+  return c10::Dispatcher::singleton()
+      .findSchemaOrThrow(matmul::name, matmul::overload_name)
+      .typed<matmul::schema>();
+}
+at::Tensor matmul::call(const at::Tensor & self, const at::Tensor & other) {
+
+    static auto op = create_matmul_typed_handle();
+    return op.call(self, other);
+}
+```
+## RedispatchFunctions.h
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch
+
+```
+    inline at::Tensor mm(c10::DispatchKeySet dispatchKeySet, const at::Tensor & self, const at::Tensor & mat2) {
+        return at::_ops::mm::redispatch(dispatchKeySet, self, mat2);
+    }
+
+```
+## RegisterCompositeImplicitAutograd_0.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul
+```
+at::Tensor wrapper_CompositeImplicitAutograd__matmul(const at::Tensor & self, const at::Tensor & other) {
+    // No device check
+  // DeviceGuard omitted
+  return at::native::matmul(self, other);
+}
+```
+# c10
+## core
+### impl
+#### TorchDispatchModeTLS.cpp
+```
+void TorchDispatchModeTLS::push_non_infra_mode_onto_stack(
+    std::shared_ptr<PyObject_TorchDispatchMode> mode) {
+  torchDispatchModeState.stack_.push_back(std::move(mode));
+
+```
 # csrc
 
 ## autograd
+### engine.cpp
+```
+void Engine::thread_init(
+  thread_main(graph_task);
 
+auto Engine::thread_main(const std::shared_ptr<GraphTask>& graph_task) -> void {
+  while (graph_task == nullptr || !graph_task->future_result_->completed()) {
+      NodeTask task = local_ready_queue->pop();
+      if (task.fn_ && !local_graph_task->has_error_.load()) {
+            evaluate_function(
+                local_graph_task,
+                task.fn_.get(),
+                task.inputs_,
+
+void Engine::evaluate_function(
+  auto outputs = call_function(graph_task, func, inputs);
+
+static variable_list call_function(
+    outputs = fn(std::move(inputs));
+
+```
+### generated
+#### Functions.h
+```
+struct TORCH_API MmBackward0 : public TraceableFunction {
+  SavedVariable mat2_;
+  SavedVariable self_;
+```
+#### Functions.cpp
+反向节点的计算：save_tensor.unpack()，。。。
+save_tensor.unpack()
+```
+variable_list MmBackward0::apply(variable_list&& grads) {
+  auto mat2 = mat2_.unpack();
+  auto self = self_.unpack();
+  return MmBackward0_apply_functional(std::move(grads), needs_input_grad, mat2, mat2_layout, mat2_sym_sizes, mat2_sym_strides, self, self_layout, self_sym_sizes, self_sym_strides);
+```
+#### VariableType_8.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm
+
+创建反向节点，包含save_tensor，dispatch，连接结果和反向节点的
+```
+at::Tensor mm(c10::DispatchKeySet ks, const at::Tensor & self, const at::Tensor & mat2) {
+  c10::intrusive_ptr<MmBackward0> grad_fn;
+  if (_any_requires_grad) {
+    grad_fn = c10::make_intrusive<MmBackward0>();
+    grad_fn->set_next_edges(collect_next_edges( self, mat2 ));
+    if (grad_fn->should_compute_output(0)) {
+      grad_fn->mat2_ = SavedVariable(mat2, false);
+    }
+  auto _tmp = ([&]() {
+    at::AutoDispatchBelowADInplaceOrView guard;
+    return at::redispatch::mm(ks & c10::after_autograd_keyset, self_, mat2_);
+  })();
+  auto result = std::move(_tmp);
+  if (grad_fn) {
+      set_history(flatten_tensor_args( result ), grad_fn);
+  }
+```
+### init.cpp
+```
+  m.def(
+      "_make_saved_tensor",
+      [](const at::Tensor& tensor,
+         bool is_output,
+         bool is_inplace_on_view) -> torch::autograd::SavedVariable {
+        return torch::autograd::SavedVariable(
+            tensor, is_output, is_inplace_on_view);
+      },
+      py::arg("tensor"),
+      py::arg("is_output"),
+  m.def(
+      "_push_saved_tensors_default_hooks",
+      [](py::function& pack_hook, py::function& unpack_hook) {
+        torch::autograd::PyDefaultSavedVariableHooks::push_hooks(
+            pack_hook, unpack_hook);
+      });
+
+    {"_push_on_torch_dispatch_stack",
+     push_on_torch_dispatch_stack,
+     METH_O,
+     nullptr},
+
+static PyObject* push_on_torch_dispatch_stack(
+    PyObject* _unused,
+    PyObject* arg) {
+      c10::impl::TorchDispatchModeTLS::push_non_infra_mode_onto_stack(
+          std::make_shared<c10::impl::PyObject_TorchDispatchMode>(
+              arg, getPyInterpreter()));
+}
+```
+### node.h
+```
+struct TraceableFunction : public Node {
+
+struct TORCH_API Node : c10::intrusive_ptr_target {
+  variable_list operator()(variable_list&& inputs) {
+      return apply(std::move(inputs));
+```
+### python_engine.cpp
+```
+void PythonEngine::thread_init(
+  Engine::thread_init(device, ready_queue, false);
+
+std::unique_ptr<SavedVariableHooks> PythonEngine::
+    get_default_saved_variable_hooks() {
+  return PyDefaultSavedVariableHooks::get_hooks();
+}
+```
+### python_saved_variable_hooks.h
+保存pack之后的结果
+
+pack(x)->data_->unpack(data_)->x
+```
+struct PySavedVariableHooks : public SavedVariableHooks {
+ private:
+  PyObject* pack_hook_;
+  PyObject* unpack_hook_;
+  PyObject* data_ = nullptr;
+};
+```
+### python_saved_variable_hooks.cpp
+```
+void PyDefaultSavedVariableHooks::push_hooks(
+    py::function& pack_hook,
+    py::function& unpack_hook) {
+  at::SavedTensorDefaultHooks::lazy_initialize();
+  at::SavedTensorDefaultHooks::push_hooks(
+      c10::SafePyObject(pack_hook.release().ptr(), getPyInterpreter()),
+      c10::SafePyObject(unpack_hook.release().ptr(), getPyInterpreter()));
+}
+std::unique_ptr<SavedVariableHooks> PyDefaultSavedVariableHooks::get_hooks() {
+void PySavedVariableHooks::call_pack_hook(const at::Tensor& tensor) {
+  py::gil_scoped_acquire acquire;
+  THPObjectPtr obj(THPVariable_Wrap(tensor));
+  THPObjectPtr packed(
+      PyObject_CallFunctionObjArgs(pack_hook_, obj.get(), nullptr));
+  data_ = packed.release();
+at::Tensor PySavedVariableHooks::call_unpack_hook() {
+  THPObjectPtr res(PyObject_CallFunctionObjArgs(unpack_hook_, data_, nullptr));
+```
 ### python_torch_functions_manual.cpp
 
 ```
@@ -221,6 +687,65 @@ struct THPVariable {
   // Payload
   at::Tensor cdata;
 ```
+### python_variable_methods.cpp
+torch.matmul的cpp接口
+```
+static PyObject * THPVariable_matmul(PyObject* self_, PyObject* args, PyObject* kwargs)
+  auto dispatch_matmul = [](const at::Tensor & self, const at::Tensor & other) -> at::Tensor {
+    pybind11::gil_scoped_release no_gil;
+    return self.matmul(other);
+  };
+  return wrap(dispatch_matmul(self, _r.tensor(0)));
+
+template <PyObject* (*Func)(PyObject*, PyObject*, PyObject*)>
+static PyObject * TypeError_to_NotImplemented_(PyObject* self, PyObject* args, PyObject* kwargs) {
+
+  PyObject* ret = Func(self, args, kwargs);
+  if (!ret && PyErr_ExceptionMatches(PyExc_TypeError)) {
+    PyErr_Clear();
+    Py_INCREF(Py_NotImplemented);
+    ret = Py_NotImplemented;
+  }
+  return ret;
+}
+```
+### saved_variable.cpp
+无hook: 保存tensor
+有hook: save_tensor在创建时保存save_tensor_hooks，并调用pack_hook，结果存在hook中
+```
+namespace torch::autograd {
+
+SavedVariable::SavedVariable(
+    const Variable& variable,
+    bool is_output,
+    bool is_inplace_on_view) {
+    std::unique_ptr<SavedVariableHooks> maybe_hooks =
+        at::SavedTensorDefaultHooks::is_enabled() ? get_default_hooks()
+                                                  : nullptr;
+    if (maybe_hooks && !variable.unsafeGetTensorImpl()->is_wrapped_number()) {
+      save_metadata(variable);
+      set_hooks_and_pack_data(std::move(maybe_hooks), variable);
+      TORCH_INTERNAL_ASSERT(!data_.defined());
+      return;
+    }
+    if (!is_output || is_leaf_) {
+      saved_original_ = true;
+      data_ = variable;
+      return;
+    }
+    save_metadata(variable);
+    data_ = variable.tensor_data();
+std::unique_ptr<SavedVariableHooks> SavedVariable::get_default_hooks() {
+  return Engine::get_default_engine().get_default_saved_variable_hooks();
+}
+void SavedVariable::set_hooks_and_pack_data(
+    std::unique_ptr<SavedVariableHooks>&& hooks,
+    const Variable& data) {
+  hooks_ = std::move(hooks);
+  hooks_->call_pack_hook(saved_original_ ? data.detach() : data);
+Variable SavedVariable::unpack(c10::intrusive_ptr<Node> saved_for) const {
+  auto data = hooks_ ? hooks_->call_unpack_hook() : data_;
+```
 
 ## Module.cpp
 
@@ -236,7 +761,21 @@ PyObject* initModule() {
   ASSERT_TRUE(THPVariable_initModule(module));
   ASSERT_TRUE(THPFunction_initModule(module));
 ```
-
+## PyInterpreter.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...->pythonFallback->TorchDispatch
+```
+void ConcretePyInterpreterVTable::dispatch(
+  PyObject* obj = handle_torch_function_no_python_arg_parser(
+      overloaded_args,
+      args.ptr(),
+      kwargs.ptr(),
+      nullptr,
+      torch_api_function_overload.ptr(),
+      nullptr,
+      &op,
+      &arguments,
+      TorchFunctionName::TorchDispatch);
+```
 ## stub.c
 
 ```
@@ -245,22 +784,33 @@ PyMODINIT_FUNC PyInit__C(void)
   return initModule();
 }
 ```
+## utils
+### python_arg_parser.cpp
+torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...->pythonFallback->TorchDispatch
+```
+auto handle_torch_function_no_python_arg_parser(
+    std::tie(ret, mode_obj) = dispatch_on_mode(
+        args,
+        kwargs,
+        py_types,
+        torch_api_function,
+        is_torch_function,
+        torch_function_name_str);
 
+torch_function_name_str(torch_api_function,args,kwargs)
+static std::tuple<py::object, py::object> dispatch_on_mode(
+    ret = py::reinterpret_steal<py::object>(PyObject_CallMethod(
+        mode_obj.ptr(),
+        torch_function_name_str,
+        "OOOO",
+        torch_api_function,
+        py_types.ptr(),
+        args,
+        kwargs));
+```
 # autograd
 
-function.py
-
-```
-class _HookMixin:
-    @staticmethod
-    def _register_hook(backward_hooks, hook):
-        if backward_hooks is None:
-            backward_hooks = OrderedDict()
-        handle = hooks.RemovableHandle(backward_hooks)
-        backward_hooks[handle.id] = hook
-        return backward_hooks, handle
-```
-
+## function.py
 ```
 flash_attn_qkvpacked_func = FlashAttnQKVPackedFunc.apply
 
@@ -281,9 +831,78 @@ class FlashAttnFunc(torch.autograd.Function):
             dv = torch.empty_like(v)
             _flash_attn_backward(
 ```
+```
+class _HookMixin:
+    @staticmethod
+    def _register_hook(backward_hooks, hook):
+        if backward_hooks is None:
+            backward_hooks = OrderedDict()
+        handle = hooks.RemovableHandle(backward_hooks)
+        backward_hooks[handle.id] = hook
+        return backward_hooks, handle
+```
+## graph.py
+设置save_tensor_hooks
+
+前向保存的save_tesor实际上是经过save_tensor_hooks的结果
+```
+class saved_tensors_hooks:
+    In that context, the ``pack_hook`` function will be called every time an
+    operation saves a tensor for backward (this includes intermediary results
+    saved using
+    :func:`~torch.autograd.function._ContextMethodMixin.save_for_backward` but
+    also those recorded by a PyTorch-defined operation). The output of
+    ``pack_hook`` is then stored in the computation graph instead of the
+    original tensor.
+    def __enter__(self) -> None:
+        torch._C._autograd._push_saved_tensors_default_hooks(
+            self.pack_hook, self.unpack_hook
+        )
+
+    def __exit__(self, *args: object) -> None:
+        torch._C._autograd._pop_saved_tensors_default_hooks()
+
+```
+
+
+
+# compile
+时间流程：
+```
+Python
+   │字节码
+Dynamo
+   │FX Graph
+AOTAutograd(Ahead Of Time Autograd)
+   │AOTAutograd 并不是自己推导梯度，它依赖 Autograd Mode 建好的图，然后把这张动态图提取、追踪成一张静态的 Backward FX Graph
+Inductor
+    │
+    ├──调用 cuBLAS
+    │
+    ├──调用 cuDNN
+    │
+    ├──生成 Triton
+    │
+    └──生成 C++
+```
+
+# cuda
+## memory
+
+https://pytorch.org/memory_viz
+
+```
+_record_memory_history()
+_dump_snapshot(file_name)
+_record_memory_history(enabled=None)
+```
 
 # distributed
 
+## fsdp.fully_shard
+Each call to fully_shard creates one communication group containing all parameters in the module that are not already assigned to a group from an earlier call on a submodule. Each group’s parameters are all-gathered together in one collective before forward, and their gradients are reduce-scattered together in one collective after backward. In forward, all-gathers run on a separate CUDA stream, so the next module’s all-gather can overlap with the current module’s forward compute. Each module’s pre-forward hook issues its own all-gather and waits for it to complete before running the module.
+
+mesh (Optional[DeviceMesh]) – This data parallel mesh defines the sharding and device. If 1D, then parameters are fully sharded across the 1D mesh (FSDP) with (Shard(0),) placement. If 2D, then parameters are sharded across the 1st dim and replicated across the 0th dim (HSDP) with (Replicate(), Shard(0)) placement. The mesh’s device type gives the device type used for communication; if a CUDA or CUDA-like device type, then we use the current device.
 ## run
 
 node==机器，worker==进程(GPU)，job==模型实例
@@ -313,12 +932,23 @@ comm backend：gloo，mpi，nccl，xccl，ucc. 数据传输
 torchrun will pass the --local-rank=<rank> argument to your script.
 ```
 
+# export
+```
+Python
+   │
+Dynamo
+   │
+ExportedProgram
+   │
+保存
+```
 # library
 
+为 aten 命名空间下已存在的算子（如 aten::relu）替换 / 添加自定义实现
 ```
     _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
     _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
-为 aten 命名空间下已存在的算子（如 aten::relu）替换 / 添加自定义实现；
+
 ```
 
 # nn
@@ -450,6 +1080,33 @@ class Module:
 <class 'torch.Tensor'>
 ```
 
+# profiler
+
+timeline:
+
+https://ui.perfetto.dev
+
+chrome://tracing
+
+memory:
+
+pip install torch_tb_profiler
+
+tensorboard --logdir dir_name
+```
+p=profile(schedule,on_trace_ready,profile_memory)
+
+p.step()
+
+tb_handler=tensorboard_trace_handler(dir_name)
+def on_trace_ready_fn(p):
+    p.export_chrome_trace(file_name)
+    #tb_hander(p)
+
+schedule(wait,warmup,active,repeat)
+```
+active结束调用一次on_trace_ready，step一次表示走完一步
+
 # Tensor
 
 ```
@@ -461,13 +1118,243 @@ next_functions = [
 第二个元素（input_index）：该节点在父操作中的输入索引（仅多输入操作有用，单输入操作下为 0）。
 ```
 
+chunk: view，全部释放才释放显存
+
+detach: Returned Tensor shares the same storage with the original one. 不再有grad_fn，反向没法找到下一个函数
+
+items(): D2H+sync
+
 view: Returns a new tensor with the same data as the self tensor but of a different shape.
 
-detach: Returned Tensor shares the same storage with the original one.
-
-与普通的 Python 列表不同，torch.zeros 在调用时会立即在内存（RAM）或显存（VRAM）中开辟连续的物理空间，并将所有位（bits）初始化为 0。
-
 # utils
+## _python_dispatch.py
+
+```
+def _push_mode(mode: TorchDispatchMode) -> None:
+        _push_on_torch_dispatch_stack(mode)
+
+
+class TorchDispatchMode:
+    def __enter__(self):
+        _push_mode(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _pop_mode(mb_dk_or_mode_key)
+```
+## checkpoint
+
+发现没保存checkpoint输入? 
+
+Use MUST_* over PREFER_* to indicate that the policy should not be overridden by other subsystems like torch.compile.
+
+```
+def context_fn():
+    def policy_fn(ctx, op, *args, **kwargs):
+        global forward_idx, recompute_idx
+
+        if op != torch.ops.aten.mm.default:
+            return CheckpointPolicy.PREFER_SAVE
+
+        if ctx.is_recompute:
+            recompute_idx += 1
+            idx = recompute_idx
+        else:
+            forward_idx += 1
+            idx = forward_idx
+
+        if idx % 2 == 0:
+            return CheckpointPolicy.PREFER_RECOMPUTE
+        else:
+            return CheckpointPolicy.MUST_SAVE
+    return create_selective_checkpoint_contexts(policy_fn)
+y = checkpoint(
+    model,
+    x,
+    use_reentrant=False,
+    context_fn=context_fn,
+    early_stop=False
+)
+loss = y.sum()
+loss.backward()
+```
+
+### checkpoint.py
+_CheckpointFrame保存checkpoint输入tensor，前向save_tensor不保存任何tensor，save_op保存输出
+
+反向一开始就执行整个checkpoint的前向，_CheckpointFrame保存反向需要的tensor，recompute_op计算，TorchDispatchMode返回输出
+```
+new_frame.save_inputs(*args)保存输入tensor
+_checkpoint_hook.__enter__给设置save_tensor_hooks
+user_forward_context.__enter__设置_CachingTorchDispatchMode
+前向: save_tensor.pack_hook没有保存tensor，TorchDispatchMode调用算子，TorchDispatchMode保存save_op输出
+user_forward_context.__exit__移除TorchDispatchMode
+_checkpoint_hook.__exit__移除hooks
+反向: save_tensor.unpack_hook
+    once:
+        _recomputation_hook.__enter__给设置save_tensor_hooks
+        user_recompute_context.__enter__设置_CachedTorchDispatchMode
+        前向: save_tensor.pack_hook将tensor保存到frame，TorchDispatchMode调用recompute_op，返回save_op,recompute_op输出
+        user_recompute_context.__exit__移除TorchDispatchMode
+        _recomputation_hook.__exit__移除hooks
+    从frame取结果
+```
+```
+from torch._C._autograd import _make_saved_tensor, SavedTensor
+
+@torch._disable_dynamo
+def checkpoint(
+    context_fn: Callable[[], Tuple[ContextManager, ContextManager]] = noop_context_fn,
+    if use_reentrant:
+        if context_fn is not noop_context_fn or debug is not False:
+            raise ValueError(
+                "Passing `context_fn` or `debug` is only supported when "
+                "use_reentrant=False."
+            )
+        return CheckpointFunction.apply(function, preserve, *args)
+    else:
+        gen = _checkpoint_without_reentrant_generator(
+            function, preserve, context_fn, determinism_check, debug, early_stop, *args, **kwargs
+        )
+        # Runs pre-forward logic
+        next(gen)
+        try:
+            ret = function(*args, **kwargs)
+        try:
+            next(gen)
+        except StopIteration:
+            return ret
+
+class _CheckpointFrame:
+    def __init__(self, recompute_fn, early_stop, unpack_error_cb, metadata_fn) -> None:
+        self.recompute_fn = recompute_fn
+        self.saved_args: List[Any] = []
+        self.recomputed: DefaultDict[
+            int, weakref.WeakKeyDictionary[_Handle, torch.Tensor]
+        ] = defaultdict(weakref.WeakKeyDictionary)
+#弱引用，随着反向进行可以释放中间激活
+    def save_inputs(self, *args):
+        self.saved_args = [
+            _make_saved_tensor(arg, is_output=False)
+            if isinstance(arg, torch.Tensor) else arg
+            for arg in args
+        ]
+
+class _checkpoint_hook(torch.autograd.graph.saved_tensors_hooks):
+    def __init__(self, frame) -> None:
+        def pack_hook(x):
+            # See Rule 4 above
+            holder = _Holder()
+            frame.weak_holders.append(weakref.ref(holder))
+            # Save metadata to detect non-determinism
+            if frame.metadata_fn is not None:
+                with torch.no_grad():
+                    frame.x_metadatas.append(frame.metadata_fn(x))
+            return holder
+
+        def unpack_hook(holder):
+            gid: GraphExecGroup | None | int = GraphExecGroup._get_current_group()
+            if not frame.is_recomputed[gid]:
+                args = frame.get_inputs()
+
+                try:
+                    with _recomputation_hook(
+                        weakref.ref(frame), gid
+                    ), torch.autograd.enable_grad():
+                        # See Note: [compiled autograd and checkpoint unpack hook]
+                        _run_fn_with_dynamo_disabled(frame.recompute_fn, *args)
+                frame.is_recomputed[gid] = True
+            ret = frame.recomputed[gid][holder.handles[gid]]
+            holder.handles[gid] = None
+            return ret
+
+        if frame.unpack_error_cb is not None:
+            def unpack_hook_with_error_cb(holder):
+                try:
+                    return unpack_hook(holder)
+                except CheckpointError as e:
+                    frame.unpack_error_cb(e)
+            super().__init__(pack_hook, unpack_hook_with_error_cb)
+        else:
+            super().__init__(pack_hook, unpack_hook)
+
+class _recomputation_hook(torch.autograd.graph.saved_tensors_hooks):
+    def __init__(self, target_frame_ref: ReferenceType, gid: GraphExecGroup | int) -> None:
+        @torch._dynamo.disable
+        def pack_hook(x):
+            x = x.detach() if x.requires_grad else x
+            if holder is not None:
+                _internal_assert(holder.handles.get(gid, None) is None)
+                holder.handles[gid] = _Handle()
+                target_frame.recomputed[gid][holder.handles[gid]] = x
+            return x
+
+        def unpack_hook(x):
+            return x
+
+        super().__init__(pack_hook, unpack_hook)
+
+def _checkpoint_without_reentrant_generator(
+    forward_context, recompute_context = context_fn()
+    def recompute_fn(*args) -> None:
+            with (
+                device_autocast_ctx,
+                torch.amp.autocast("cpu", **cpu_autocast_kwargs),
+                recompute_context,
+                device_ctx,
+                nested_fx_trace_ctx,
+            ):  # type: ignore[attr-defined]
+                fn(*args, **kwargs)
+    new_frame = _CheckpointFrame(
+        recompute_fn,
+        _enable_checkpoint_early_stop if _enable_checkpoint_early_stop is not None else early_stop,
+        unpack_error_cb,
+        metadata_fn
+    )
+    new_frame.save_inputs(*args)
+    with _checkpoint_hook(new_frame), forward_context:
+        try:
+            yield
+    new_frame.forward_completed = True
+
+class _CachingTorchDispatchMode(TorchDispatchMode):
+    def __init__(self, policy_fn, storage, ac_graph_id=None) -> None:
+        self.policy_fn = policy_fn
+        self.storage = storage
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        out = func(*args, **kwargs)
+        policy = self.policy_fn(SelectiveCheckpointContext(is_recompute=False, op_output=out),
+                                func, *args, **kwargs)
+        if policy in (CheckpointPolicy.MUST_SAVE, CheckpointPolicy.PREFER_SAVE) or is_compiling:
+            self.storage[key][idx] = tree_map(lambda x: _VersionWrapper(_detach_helper(x)), out)
+        else:
+            self.storage[key][idx] = _RECOMPUTE
+        return out
+
+class _CachedTorchDispatchMode(TorchDispatchMode):
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        func_storage = self.storage.get(key)
+        entry = func_storage.get(idx)
+        elif entry is _RECOMPUTE:
+            kwargs = {} if kwargs is None else kwargs
+            return func(*args, **kwargs)
+        else:
+            func_storage[idx] = _CONSUMED
+            return tree_map(lambda x: x.get_val(self.allow_cache_entry_mutation), entry)
+
+def create_selective_checkpoint_contexts(policy_fn_or_list, allow_cache_entry_mutation=False):
+    return (
+        _CachingTorchDispatchMode(policy_fn, storage),
+        _CachedTorchDispatchMode(None, storage, allow_cache_entry_mutation),
+    )
+```
+
+## data
+
+iterableDataset
+
+
+# ...
 
 hooks.py
 

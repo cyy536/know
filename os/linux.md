@@ -1121,6 +1121,10 @@ $ sudo pacman -Sy firefox
 
 PPA 是 Ubuntu 官方源的 “补充仓库”，由社区开发者 / 团队维护，用来提供官方源里没有的软件包；
 
+apt: 下载 python3.11-dev.deb，解决依赖
+
+dpkg: 解包，放文件到系统，注册安装信息
+
 apt 装的软件在 /usr/bin（系统级），脚本 / 编译装的软件在 /usr/local/bin（本地自定义级）
 
 # ...
@@ -1156,6 +1160,13 @@ diff -r -x "node_modules" -x ".git" -x "*.log" dir1 dir2
 换行符不同也算不同
 ```
 
+## dpkg
+
+```
+-l list
+-L pack 一个包安装了哪些文件
+-S /usr/bin/python3.11 某个文件属于哪个包
+```
 ## du
 
 ```
@@ -1192,9 +1203,10 @@ grep -rni --exclude="*.log" "kk" /usr/
 grep -rni --exclude-dir=build "distributed_strategy.proto" .
 grep -rni --include="*.h" "ShardingMergeForTensors" Paddle/
 grep -A 10 "jsd"
-grep -v -e "tom" -e "lisi" names.txt 既不包含"tom"也不包含"lisi"的行
--v 参数表示反向匹配,即显示不包含匹配项的行
--e 参数用于指定多个匹配模式
+grep -B 10 "jsd"
+grep -C 10 "jsd"
+grep -v -e "tom" -e "lisi" names.txt 
+既不包含"tom"也不包含"lisi"的行
 ```
 
 ## ip
@@ -1220,6 +1232,8 @@ curl -I https://www.google.com
 curl -X POST "$API_URL" \
       -H "Content-Type:application/json" \
       -d "{ \"message\": { \"body\": [ { \"type\": \"TEXT\", \"content\": \"${MESSAGE}\" } ] } }"
+curl -L -o 文件名 URL
+-L：跟随重定向
 ```
 
 wget 专注下载
@@ -1251,6 +1265,14 @@ ps -aux
 pkill -9 -f ".*run_pretrain_auto.py"
 -f==--full
 ```
+
+## split
+
+```
+split -b 50M -d big big_p
+-d数字后缀
+cat big_p* > big
+```
 ## ss
 
 socket statistics
@@ -1281,6 +1303,8 @@ tar -xf xx.tar -C out/
 
 ```
 gzip -dk file.gz
+-d：decompress，解压
+-k：keep，保留输入文件
 ```
 
 .tar.gz/.tgz/.zip（= tar + gzip）
@@ -1288,5 +1312,9 @@ gzip -dk file.gz
 ## watch
 
 ```
-watch -n 3 "ps -aux | grep -E 'run|python'"
+watch -n 3 'ps -aux | grep -E "run|python"'
+
+watch -n 2 'python -c "import sys; print(int(sys.argv[1])/1024/1024/1024,\"GiB\")" `cat /sys/fs/cgroup/memory/memory.usage_in_bytes`'
+
+alias wm='watch -n 2 '\''python -c "import sys; print(int(sys.argv[1])/1024/1024/1024,\"GiB\")" `cat /sys/fs/cgroup/memory/memory.usage_in_bytes`'\'
 ```
