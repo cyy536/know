@@ -193,6 +193,11 @@ torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKer
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel
 
 ```
+inline BoxedKernel::BoxedKernel(
+    std::unique_ptr<OperatorKernel> functor,
+    InternalBoxedKernelFunction* boxed_kernel_func)
+    : functor_(std::move(functor)), boxed_kernel_func_(boxed_kernel_func) {}
+
 inline void BoxedKernel::callBoxed(
     const OperatorHandle& opHandle,
     DispatchKeySet dispatchKeySet,
@@ -324,24 +329,26 @@ inline void KernelFunction::callBoxed(
 ```
 ### dispatch
 #### Dispatcher.h
-根据输入生成dispatchKeySet，选KernelFunction
+根据输入tensors生成dispatchKeySet，选KernelFunction
 
 torch.matmul->Tensor::matmul->matmul::call->dispatcher
 
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed
 
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...
+
+
 ```
-class TypedOperatorHandle<Return(Args...)> final : public OperatorHandle {
-  C10_ALWAYS_INLINE Return call(Args... args) const {
-    return c10::Dispatcher::singleton().call<Return, Args...>(
-        *this, std::forward<Args>(args)...);
-  }
-  C10_ALWAYS_INLINE Return
-  redispatch(DispatchKeySet currentDispatchKeySet, Args... args) const {
-    return c10::Dispatcher::singleton().redispatch<Return, Args...>(
-        *this, currentDispatchKeySet, std::forward<Args>(args)...);
-  }
+class TORCH_API Dispatcher final {
+  LeftRight<ska::flat_hash_map<OperatorName, OperatorHandle>>
+      operatorLookupTable_;
+  std::list<OperatorDef> operators_;
+
+  struct OperatorDef final {
+    explicit OperatorDef(OperatorName&& op_name) : op(std::move(op_name)) {}
+
+    impl::OperatorEntry op;
+
 
 C10_ALWAYS_INLINE_UNLESS_MOBILE Return Dispatcher::call(
     const TypedOperatorHandle<Return(Args...)>& op,
@@ -372,13 +379,114 @@ inline Return Dispatcher::redispatch(
       op, currentDispatchKeySet, std::forward<Args>(args)...);
 
 class TORCH_API OperatorHandle {
+  explicit OperatorHandle(
+      std::list<Dispatcher::OperatorDef>::iterator operatorIterator)
+      : operatorDef_(&*operatorIterator), operatorIterator_(operatorIterator) {}
+
   void redispatchBoxed(DispatchKeySet ks, Stack* stack) const {
     c10::Dispatcher::singleton().redispatchBoxed(*this, ks, stack);
   }
 
+class TypedOperatorHandle<Return(Args...)> final : public OperatorHandle {
+  C10_ALWAYS_INLINE Return call(Args... args) const {
+    return c10::Dispatcher::singleton().call<Return, Args...>(
+        *this, std::forward<Args>(args)...);
+  }
+  C10_ALWAYS_INLINE Return
+  redispatch(DispatchKeySet currentDispatchKeySet, Args... args) const {
+    return c10::Dispatcher::singleton().redispatch<Return, Args...>(
+        *this, currentDispatchKeySet, std::forward<Args>(args)...);
+  }
+
 ```
 #### Dispatcher.cpp
+dispatcher记录lib.namespace，记录op，kernel注册到op
+
+算子: 做什么，例如 add
+
+backend: 在哪里做，例如 CPU/CUDA
+
+kernel: 具体怎么做，例如 add_cpu/add_cuda，有些 kernel 依赖 backend
+
+一个算子可以对应多个 kernel，这些对应关系组成该算子的 dispatch table
+
+输入tensors和线程状态 (autocast) 带有keys，算子的 DispatchKeyExtractor 提取并过滤 (fallthrough) 本次调用的 keys
+
+Dispatcher 选择优先级最高的 key (kernel)，包装层 kernel 可以主动 redispatch，因此一次算子调用可能经过多次选择
+
 ```
+Dispatcher
+    libraries_
+    std::list<OperatorDef> operators_
+    LeftRight<ska::flat_hash_map<OperatorName, OperatorHandle>> operatorLookupTable_;
+
+OperatorHandle
+    OperatorDef
+        OperatorEntry
+            DispatchKeyExtractor
+                dispatch_arg_indices_reverse
+                nonFallthroughKeys_
+            dispatchTable_
+            kernels_
+```
+
+```
+RegistrationHandleRAII Dispatcher::registerLibrary(std::string ns, std::string debug) {
+  libraries_.emplace(ns, std::move(debug));
+  return RegistrationHandleRAII([guard = this->guard_, this, ns] {
+    std::lock_guard<std::mutex> lock(guard->mutex);
+    if (!guard->alive.load()) {
+      return;
+    }
+    deregisterLibrary_(ns);
+  });
+RegistrationHandleRAII Dispatcher::registerDef(FunctionSchema schema, std::string debug, std::vector<at::Tag> tags) {
+  OperatorName op_name = schema.operator_name();
+  auto op = findOrRegisterName_(op_name);
+  op.operatorDef_->op.registerSchema(std::move(schema), std::move(debug), std::move(tags));
+  ++op.operatorDef_->def_count;
+  ++op.operatorDef_->def_and_impl_count;
+  return RegistrationHandleRAII([guard = this->guard_, this, op, op_name] {
+    // we need a lock to avoid concurrent writes
+    std::lock_guard<std::mutex> lock(guard->mutex);
+    if (!guard->alive.load()) {
+      return;
+    }
+    deregisterDef_(op, op_name);
+  });
+
+OperatorHandle Dispatcher::findOrRegisterName_(const OperatorName& op_name) {
+  const auto found = findOp(op_name);
+  if (found.has_value()) {
+    return *found;
+  }
+
+  operators_.emplace_back(OperatorName(op_name));
+  OperatorHandle handle(--operators_.end());
+  operatorLookupTable_.write([&] (ska::flat_hash_map<OperatorName, OperatorHandle>& operatorLookupTable) {
+    operatorLookupTable.emplace(op_name, handle);
+  });
+
+std::optional<OperatorHandle> Dispatcher::findOp(const OperatorName& overload_name) {
+  return operatorLookupTable_.read([&] (const ska::flat_hash_map<OperatorName, OperatorHandle>& operatorLookupTable) -> std::optional<OperatorHandle> {
+    auto found = operatorLookupTable.find(overload_name);
+    if (found == operatorLookupTable.end()) {
+      return std::nullopt;
+    }
+    return found->second;
+  });
+}
+
+RegistrationHandleRAII Dispatcher::registerImpl(
+  auto op = findOrRegisterName_(op_name);
+  auto handle = op.operatorDef_->op.registerKernel(
+    *this,
+    dispatch_key,
+    std::move(kernel),
+  ++op.operatorDef_->def_and_impl_count;
+  return RegistrationHandleRAII([guard = this->guard_, this, op, op_name, dispatch_key, handle] {
+
+
  [call] op=[aten::matmul], key=[PythonTLSSnapshot]
   [redispatchBoxed] op=[aten::matmul], key=[AutogradCUDA]
    [call] op=[aten::mm], key=[PythonTLSSnapshot]
@@ -390,6 +498,223 @@ class TORCH_API OperatorHandle {
 bool show_dispatch_trace() {
   static auto envar = c10::utils::get_env("TORCH_SHOW_DISPATCH_TRACE");
 ```
+#### DispatchKeyExtractor.cpp
+```
+void DispatchKeyExtractor::setOperatorHasFallthroughForKey(DispatchKey k, bool has_fallthrough) {
+  if (has_fallthrough) {
+    nonFallthroughKeys_ = nonFallthroughKeys_.remove(k);
+  } else {
+    nonFallthroughKeys_ = nonFallthroughKeys_.add(k);
+  }
+  if (isPerBackendFunctionalityKey(toFunctionalityKey(k))) {
+    if (has_fallthrough) {
+      nonFallthroughKeysPerBackend_[backend_idx] = nonFallthroughKeysPerBackend_[backend_idx].remove(k);
+    } else {
+      nonFallthroughKeysPerBackend_[backend_idx] = nonFallthroughKeysPerBackend_[backend_idx].add(k);
+    }
+//如果所有backend相同，用全局即可
+    for (const auto i : c10::irange(nonFallthroughKeysPerBackend_.size() - 1)) {
+      if (nonFallthroughKeysPerBackend_[i] != nonFallthroughKeysPerBackend_[i+1]) {
+        requiresBitsetPerBackend_ = true;
+        return;
+      }
+    }
+    requiresBitsetPerBackend_ = false;
+    return;
+  } else {
+//所有backend都适用
+    if (has_fallthrough) {
+      for (const auto i : c10::irange(nonFallthroughKeysPerBackend_.size())) {
+        nonFallthroughKeysPerBackend_[i] = nonFallthroughKeysPerBackend_[i].remove(k);
+      }
+    } else {
+      for (const auto i : c10::irange(nonFallthroughKeysPerBackend_.size())) {
+        nonFallthroughKeysPerBackend_[i] = nonFallthroughKeysPerBackend_[i].add(k);
+      }
+    }
+  }
+```
+#### OperatorEntry.cpp
+```
+OperatorEntry
+    DispatchKeyExtractor
+    std::array<KernelFunction, c10::num_runtime_entries> dispatchTable_//最新kernel
+    kernels_//一个dispatchkey上可以注册多个kernel，使用最新的，可删除后使用旧的
+```
+```
+OperatorEntry::OperatorEntry(OperatorName&& operator_name)
+: name_(std::move(operator_name)), dispatchTable_(), dispatchKeyExtractor_(DispatchKeyExtractor::makeUninitialized()), is_observed_(ObservedOperators::isObserved(name_))
+{
+  const auto& dispatcher = c10::Dispatcher::singleton();
+  const auto& dispatch_table_index_to_key = getDispatchTableIndexToKey();
+//生成所有可dispatch的key
+  for (const auto dispatch_ix: c10::irange(dispatcher.backendFallbackKernels_.size())) {
+//当某个算子没有该 key 的专用 kernel 时，可以使用该 key 的通用 fallback。保底
+    const auto& bfk = dispatcher.backendFallbackKernels_[dispatch_ix];
+    if (bfk.kernel.isValid()) {
+      dispatchTable_[dispatch_ix] = bfk.kernel;
+      if (bfk.kernel.isFallthrough()) {
+//跳过
+        dispatchKeyExtractor_.setOperatorHasFallthroughForKey(dispatch_table_index_to_key[dispatch_ix], true);
+      }
+    } else {
+      dispatchTable_[dispatch_ix] = missingKernel().kernel;
+    }
+  }
+}
+
+static const auto& getDispatchTableIndexToKey() {
+  static const auto result = []() {
+    using result_type = std::array<DispatchKey, c10::num_runtime_entries>;
+    result_type arr;
+    arr.fill(DispatchKey::Undefined);
+    for (const auto dispatch_key: allDispatchKeysInFullSet()) {
+      const auto index = getDispatchTableIndexForDispatchKey(dispatch_key);
+      TORCH_INTERNAL_ASSERT(arr.at(index) == DispatchKey::Undefined);
+      arr.at(index) = dispatch_key;
+    }
+    return arr;
+  }();
+  return result;
+}
+
+static const std::vector<DispatchKey>& allDispatchKeysInFullSet() {
+  static const auto result = []() {
+    std::vector<DispatchKey> vec;
+    for (const auto dispatch_key: DispatchKeySet(DispatchKeySet::FULL)) {
+      vec.push_back(dispatch_key);
+    }
+    return vec;
+  }();
+  return result;
+}
+
+void OperatorEntry::registerSchema(FunctionSchema&& schema, std::string&& debug, std::vector<at::Tag> tags) {
+  TORCH_INTERNAL_ASSERT(!schema_.has_value());
+  dispatchKeyExtractor_.registerSchema(schema);
+  schema_ = AnnotatedSchema(std::move(schema), std::move(debug));
+}
+
+//增加kernel，更新DispatchTable
+OperatorEntry::AnnotatedKernelContainerIterator OperatorEntry::registerKernel(
+  const c10::Dispatcher& dispatcher,
+  std::optional<DispatchKey> dispatch_key,
+  KernelFunction kernel,
+  std::optional<CppSignature> cpp_signature,
+  std::unique_ptr<FunctionSchema> inferred_function_schema,
+  std::string debug
+) {
+  auto& k = dispatch_key.has_value() ? kernels_[*dispatch_key] : kernels_[DispatchKey::CompositeImplicitAutograd];
+  k.emplace_front(std::move(kernel), std::move(inferred_function_schema), std::move(debug));
+  AnnotatedKernelContainerIterator inserted = k.begin();
+  if (dispatch_key.has_value()) {
+    updateDispatchTable_(dispatcher, *dispatch_key);
+  } else {
+    updateDispatchTableFull_(dispatcher);
+  }
+  return inserted;
+
+void OperatorEntry::updateDispatchTable_(const c10::Dispatcher& dispatcher, DispatchKey dispatch_key) {
+  if (dispatch_key == DispatchKey::Undefined) {
+    updateDispatchTableEntry_(dispatcher, dispatch_key);
+    return;
+  }
+  for (auto k : c10::getRuntimeDispatchKeySet(dispatch_key)) {
+    updateDispatchTableEntry_(dispatcher, k);
+  }
+  if (dispatch_key == DispatchKey::CompositeImplicitAutograd
+   || dispatch_key == DispatchKey::CompositeExplicitAutograd
+   || dispatch_key == DispatchKey::CompositeExplicitAutogradNonFunctional) {
+    updateDispatchTableEntry_(dispatcher, DispatchKey::Undefined);
+  }
+  if (c10::isBackendDispatchKey(dispatch_key)) {
+    DispatchKey autograd_key = getAutogradKeyFromBackend(toBackendComponent(dispatch_key));
+    updateDispatchTableEntry_(dispatcher, autograd_key);
+  }
+}
+
+void OperatorEntry::updateDispatchTableEntry_(const c10::Dispatcher& dispatcher, DispatchKey dispatch_key) {
+  dispatchTable_[dispatch_ix] = computeDispatchTableEntry(dispatcher, dispatch_key);
+  dispatchKeyExtractor_.setOperatorHasFallthroughForKey(dispatch_key, dispatchTable_[dispatch_ix].isFallthrough());
+
+const KernelFunction& OperatorEntry::computeDispatchTableEntry(const c10::Dispatcher& dispatcher, DispatchKey dispatch_key) const {
+  return computeDispatchTableEntryWithDebug(dispatcher, dispatch_key).first.kernel;
+}
+
+std::pair<const AnnotatedKernel&, const char*> OperatorEntry::computeDispatchTableEntryWithDebug(const c10::Dispatcher& dispatcher, DispatchKey dispatch_key) const {
+  if (auto direct_registration = getKernelForDispatchKey(dispatch_key)) {
+    return {*direct_registration, "kernel"};
+  }
+
+const AnnotatedKernel* OperatorEntry::getKernelForDispatchKey(DispatchKey dispatch_key) const{
+  auto kern_it = kernels_.find(dispatch_key);
+  if (kern_it != kernels_.end()) {
+    return &kern_it->second.front();
+  }
+  return nullptr;
+}
+```
+#### RegistrationHandleRAII.h
+```
+class RegistrationHandleRAII final {
+  explicit RegistrationHandleRAII(std::function<void()> onDestruction)
+      : onDestruction_(std::move(onDestruction)) {}
+  ~RegistrationHandleRAII() {
+    if (onDestruction_) {
+      onDestruction_();
+    }
+  }
+```
+### library.cpp
+DEF注册lib.namespace到dispatcher，记录句柄（用于lib释放时注销），FRAGMENT，IMPL啥也不干
+
+注册算子签名到dispatcher，记录句柄
+
+注册KernelFunction到dispatcher，记录句柄
+```
+Library::Library(Kind kind, std::string ns, std::optional<c10::DispatchKey> k, const char* file, uint32_t line)
+  : kind_(kind)
+  , ns_(ns == "_" ? std::nullopt : std::make_optional(std::move(ns)))
+  , dispatch_key_(k.value_or(CatchAll) == CatchAll ? std::optional<c10::DispatchKey>() : k)
+    switch (kind_) {
+      case DEF:
+        // Only DEFs require library uniqueness; fragments
+        // don't register a library
+        registrars_.emplace_back(
+          c10::Dispatcher::singleton().registerLibrary(
+            // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
+            ns_.value(), debugString(file_, line_)
+          )
+        );
+        [[fallthrough]];
+
+Library& Library::_def(c10::FunctionSchema&& schema, c10::OperatorName* out_name, const std::vector<at::Tag>& tags, _RegisterOrVerify rv) & {
+  switch (rv) {
+    case _RegisterOrVerify::REGISTER:
+      registrars_.emplace_back(
+        c10::Dispatcher::singleton().registerDef(
+          std::move(schema),
+          debugString(file_, line_),
+          tags
+        )
+      );
+      break;
+Library& Library::_impl(const char* name_str, CppFunction&& f, _RegisterOrVerify rv) & {
+  switch (rv) {
+    case _RegisterOrVerify::REGISTER:
+      registrars_.emplace_back(
+        c10::Dispatcher::singleton().registerImpl(
+          std::move(name),
+          dispatch_key,
+          std::move(f.func_),
+          f.cpp_signature_,
+          std::move(f.schema_),
+          debugString(std::move(f.debug_), file_, line_)
+        )
+      );
+      break;
+```
+
 ### PythonFallbackKernel.cpp
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot
 
@@ -489,8 +814,92 @@ at::Tensor wrapper_CompositeImplicitAutograd__matmul(const at::Tensor & self, co
   return at::native::matmul(self, other);
 }
 ```
+## SavedTensorHooks.cpp
+```
+std::optional<std::pair<SafePyObject, SafePyObject>> SavedTensorDefaultHooks::get_hooks(bool ignore_is_tracing) {
+  if (!is_initialized || tls.stack.empty() || (!ignore_is_tracing && tls.is_tracing)) {
+    return std::nullopt;
+  }
+  return tls.stack.top();
+}
+
+void SavedTensorDefaultHooks::push_hooks(SafePyObject pack_hook, SafePyObject unpack_hook) {
+  TORCH_INTERNAL_ASSERT(is_initialized);
+  assertSavedTensorHooksNotDisabled();
+  tls.stack.emplace(std::move(pack_hook), std::move(unpack_hook));
+}
+```
 # c10
 ## core
+### DispatchKeySet.cpp
+```
+DispatchKeySet::iterator& DispatchKeySet::iterator::operator++() {
+//选出functionality的位
+  uint64_t masked_functionality_bits =
+      llvm::maskTrailingZeros<uint64_t>(next_functionality_) & *data_ptr_;
+  uint64_t masked_backend_bits =
+      llvm::maskTrailingZeros<uint64_t>(next_backend_) & full_backend_mask &
+      *data_ptr_;
+//找第一个为1的位
+  uint64_t first_functionality_idx =
+      llvm::findFirstSet(masked_functionality_bits);
+  uint64_t first_backendcomponent_idx = llvm::findFirstSet(masked_backend_bits);
+
+  auto new_next_functionality = first_functionality_idx + 1;
+//在dispatchset里下标
+  auto new_backendcomponent_idx = first_backendcomponent_idx + 1;
+  auto next_dispatchkey_idx = new_next_functionality - num_backends;
+//在dispatchkey里面的值
+
+  if (isPerBackendFunctionalityKey(
+          static_cast<DispatchKey>(next_dispatchkey_idx))) {
+
+    current_dispatchkey_idx_ = next_dispatchkey_idx;
+    current_backendcomponent_idx_ = new_backendcomponent_idx;
+//在dispatchkey里面的值，要加上backend偏移
+
+    uint64_t next_backendcomponent_bits =
+        llvm::maskTrailingZeros<uint64_t>(first_backendcomponent_idx + 1) &
+        full_backend_mask & *data_ptr_;
+    uint64_t next_backendcomponent_idx =
+        llvm::findFirstSet(next_backendcomponent_bits);
+//没有下一个backend了，更新functionality下标
+    if (next_backendcomponent_idx == std::numeric_limits<uint64_t>::max()) {
+      next_functionality_ = new_next_functionality;
+      next_backend_ = 0;
+    } else {
+//还有下一个backend，更新backend下标
+      next_backend_ = first_backendcomponent_idx + 1;
+    }
+  } else {
+//增加functionality bit
+    current_dispatchkey_idx_ = next_dispatchkey_idx;
+    next_functionality_ = new_next_functionality;
+  }
+  return *this;
+}
+
+
+initializeFunctionalityOffsetsAndMasks() {
+  std::array<FunctionalityOffsetAndMask, num_functionality_keys>
+      offsets_and_masks;
+//基础key
+  // manually set the first entry, which corresponds to Undefined.
+  offsets_and_masks[0] = FunctionalityOffsetAndMask(0, 0);
+  for (const auto functionality_idx : c10::irange(1, num_functionality_keys)) {
+    // functionality_idx should be Dense -> 1, ...
+    auto prev_offset_and_mask = offsets_and_masks[functionality_idx - 1];
+    auto k = static_cast<DispatchKey>(functionality_idx);
+
+    auto next_offset = prev_offset_and_mask.offset +
+        (prev_offset_and_mask.mask == 0 ? 1 : num_backends);
+//offset表示在dispatchtable里的起点，要考虑backend
+    auto next_mask = isPerBackendFunctionalityKey(k) ? full_backend_mask : 0;
+    offsets_and_masks[functionality_idx] =
+        FunctionalityOffsetAndMask(next_offset, next_mask);
+  }
+  
+```
 ### impl
 #### TorchDispatchModeTLS.cpp
 ```
@@ -499,10 +908,24 @@ void TorchDispatchModeTLS::push_non_infra_mode_onto_stack(
   torchDispatchModeState.stack_.push_back(std::move(mode));
 
 ```
-# csrc
+## util
+加锁，被处理
+```
+template <typename T>
+class Synchronized final {
+  mutable std::mutex mutex_;
+  T data_;
+  template <typename CB>
+  auto withLock(CB&& cb) {
+    std::lock_guard<std::mutex> guard(this->mutex_);
+    return std::forward<CB>(cb)(this->data_);
+  }
+```
+# torch
+## csrc
 
-## autograd
-### engine.cpp
+### autograd
+#### engine.cpp
 ```
 void Engine::thread_init(
   thread_main(graph_task);
@@ -523,14 +946,14 @@ static variable_list call_function(
     outputs = fn(std::move(inputs));
 
 ```
-### generated
-#### Functions.h
+#### generated
+##### Functions.h
 ```
 struct TORCH_API MmBackward0 : public TraceableFunction {
   SavedVariable mat2_;
   SavedVariable self_;
 ```
-#### Functions.cpp
+##### Functions.cpp
 反向节点的计算：save_tensor.unpack()，。。。
 save_tensor.unpack()
 ```
@@ -539,7 +962,7 @@ variable_list MmBackward0::apply(variable_list&& grads) {
   auto self = self_.unpack();
   return MmBackward0_apply_functional(std::move(grads), needs_input_grad, mat2, mat2_layout, mat2_sym_sizes, mat2_sym_strides, self, self_layout, self_sym_sizes, self_sym_strides);
 ```
-#### VariableType_8.cpp
+##### VariableType_8.cpp
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm
 
 创建反向节点，包含save_tensor，dispatch，连接结果和反向节点的
@@ -561,7 +984,7 @@ at::Tensor mm(c10::DispatchKeySet ks, const at::Tensor & self, const at::Tensor 
       set_history(flatten_tensor_args( result ), grad_fn);
   }
 ```
-### init.cpp
+#### init.cpp
 ```
   m.def(
       "_make_saved_tensor",
@@ -593,7 +1016,7 @@ static PyObject* push_on_torch_dispatch_stack(
               arg, getPyInterpreter()));
 }
 ```
-### node.h
+#### node.h
 ```
 struct TraceableFunction : public Node {
 
@@ -601,7 +1024,7 @@ struct TORCH_API Node : c10::intrusive_ptr_target {
   variable_list operator()(variable_list&& inputs) {
       return apply(std::move(inputs));
 ```
-### python_engine.cpp
+#### python_engine.cpp
 ```
 void PythonEngine::thread_init(
   Engine::thread_init(device, ready_queue, false);
@@ -611,7 +1034,7 @@ std::unique_ptr<SavedVariableHooks> PythonEngine::
   return PyDefaultSavedVariableHooks::get_hooks();
 }
 ```
-### python_saved_variable_hooks.h
+#### python_saved_variable_hooks.h
 保存pack之后的结果
 
 pack(x)->data_->unpack(data_)->x
@@ -623,7 +1046,7 @@ struct PySavedVariableHooks : public SavedVariableHooks {
   PyObject* data_ = nullptr;
 };
 ```
-### python_saved_variable_hooks.cpp
+#### python_saved_variable_hooks.cpp
 ```
 void PyDefaultSavedVariableHooks::push_hooks(
     py::function& pack_hook,
@@ -634,16 +1057,19 @@ void PyDefaultSavedVariableHooks::push_hooks(
       c10::SafePyObject(unpack_hook.release().ptr(), getPyInterpreter()));
 }
 std::unique_ptr<SavedVariableHooks> PyDefaultSavedVariableHooks::get_hooks() {
+  auto out = at::SavedTensorDefaultHooks::get_hooks();
+
 void PySavedVariableHooks::call_pack_hook(const at::Tensor& tensor) {
   py::gil_scoped_acquire acquire;
   THPObjectPtr obj(THPVariable_Wrap(tensor));
   THPObjectPtr packed(
       PyObject_CallFunctionObjArgs(pack_hook_, obj.get(), nullptr));
   data_ = packed.release();
+
 at::Tensor PySavedVariableHooks::call_unpack_hook() {
   THPObjectPtr res(PyObject_CallFunctionObjArgs(unpack_hook_, data_, nullptr));
 ```
-### python_torch_functions_manual.cpp
+#### python_torch_functions_manual.cpp
 
 ```
 void initTorchFunctions(PyObject* module) {
@@ -656,7 +1082,7 @@ void initTorchFunctions(PyObject* module) {
           module, "_VariableFunctions",
 ```
 
-### python_variable.cpp
+#### python_variable.cpp
 
 ```
 static PyTypeObject THPVariableType = {
@@ -679,7 +1105,7 @@ bool THPVariable_initModule(PyObject* module) {
   torch::autograd::initTorchFunctions(module);
 ```
 
-### python_variable.h
+#### python_variable.h
 
 ```
 struct THPVariable {
@@ -687,7 +1113,7 @@ struct THPVariable {
   // Payload
   at::Tensor cdata;
 ```
-### python_variable_methods.cpp
+#### python_variable_methods.cpp
 torch.matmul的cpp接口
 ```
 static PyObject * THPVariable_matmul(PyObject* self_, PyObject* args, PyObject* kwargs)
@@ -709,7 +1135,7 @@ static PyObject * TypeError_to_NotImplemented_(PyObject* self, PyObject* args, P
   return ret;
 }
 ```
-### saved_variable.cpp
+#### saved_variable.cpp
 无hook: 保存tensor
 有hook: save_tensor在创建时保存save_tensor_hooks，并调用pack_hook，结果存在hook中
 ```
@@ -747,7 +1173,7 @@ Variable SavedVariable::unpack(c10::intrusive_ptr<Node> saved_for) const {
   auto data = hooks_ ? hooks_->call_unpack_hook() : data_;
 ```
 
-## Module.cpp
+### Module.cpp
 
 ```
 static std::initializer_list<PyMethodDef> TorchMethods = {
@@ -761,7 +1187,7 @@ PyObject* initModule() {
   ASSERT_TRUE(THPVariable_initModule(module));
   ASSERT_TRUE(THPFunction_initModule(module));
 ```
-## PyInterpreter.cpp
+### PyInterpreter.cpp
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...->pythonFallback->TorchDispatch
 ```
 void ConcretePyInterpreterVTable::dispatch(
@@ -776,7 +1202,7 @@ void ConcretePyInterpreterVTable::dispatch(
       &arguments,
       TorchFunctionName::TorchDispatch);
 ```
-## stub.c
+### stub.c
 
 ```
 PyMODINIT_FUNC PyInit__C(void)
@@ -784,8 +1210,8 @@ PyMODINIT_FUNC PyInit__C(void)
   return initModule();
 }
 ```
-## utils
-### python_arg_parser.cpp
+### utils
+#### python_arg_parser.cpp
 torch.matmul->Tensor::matmul->matmul::call->dispatcher->KernelFunction->BoxedKernelWrapper->BoxedKernel->PythonTLSSnapshot->redispatchBoxed->BoxedKernel->unboxed->native::matmul->native::_matmul_impl->mm::call->...->autograd::mm->at::redispatch::mm->mm::redispatch->...->pythonFallback->TorchDispatch
 ```
 auto handle_torch_function_no_python_arg_parser(
@@ -808,7 +1234,105 @@ static std::tuple<py::object, py::object> dispatch_on_mode(
         args,
         kwargs));
 ```
-# autograd
+#### python_dispatch.cpp
+```
+CppFunction
+    KernelFunction func_
+        BoxedKernel boxed_kernel_func_
+            PythonKernelHolder:OperatorKernel functor_
+                c10::SafePyObject func_
+    dispatch_key_;
+```
+```
+static c10::Synchronized<std::vector<std::unique_ptr<std::string>>>
+    leaked_python_filenames_;
+
+static c10::Synchronized<ska::flat_hash_map<
+    c10::OperatorName,
+    ska::flat_hash_map<c10::DispatchKey, std::shared_ptr<c10::SafePyObject>>>>
+    python_registrations_;
+
+  m.def(
+      "_dispatch_library",
+      [](const char* kind,
+         std::string name,
+         const char* dispatch,
+         const char* file,
+         uint32_t linenum) {
+        HANDLE_TH_ERRORS
+        // Store the file string in global storage to ensure it remains valid
+        // for the lifetime of the Library object
+        const char* leaked_file =
+            leaked_python_filenames_.withLock([&](auto& filenames) {
+              filenames.push_back(std::make_unique<std::string>(file));
+              return filenames.back()->c_str();
+            });
+
+        return std::make_unique<torch::Library>(
+            parseKind(kind),
+            std::move(name),
+            std::string(dispatch).empty()
+                ? std::nullopt
+                : std::make_optional(c10::parseDispatchKey(dispatch)),
+            leaked_file,
+            linenum);
+        END_HANDLE_TH_ERRORS_PYBIND
+      },
+      .def(
+          "define",
+          [](const py::object& self,
+             const char* schema,
+             const char* alias_analysis,
+             const std::vector<at::Tag>& tags) {
+            auto parsed_schema =
+                torch::schema(schema, parseAliasAnalysisKind(alias_analysis));
+            self.cast<torch::Library&>().def(
+                std::move(parsed_schema), tags, register_or_verify());
+            // TODO: this is dumb, had to make a second copy
+            return torch::schema(schema, parseAliasAnalysisKind(alias_analysis))
+                .name();
+          },
+      .def(
+          "impl",
+          [](const py::object& self,
+             const char* name,
+             // TODO: empty string no longer works
+             c10::DispatchKey dispatch,
+             py::object func,
+             bool with_keyset) {
+            HANDLE_TH_ERRORS
+            auto& lib = self.cast<torch::Library&>();
+            if (func.is(py::module::import("torch.library")
+                            .attr("fallthrough_kernel"))) {
+              lib.impl(
+                  name,
+                  torch::dispatch(dispatch, CppFunction::makeFallthrough()),
+                  register_or_verify());
+            } else {
+              lib.impl(
+                  name,
+                  torch::dispatch(
+                      dispatch,
+                      CppFunction::makeFromBoxedFunctor(
+                          std::make_unique<PythonKernelHolder>(
+                              func, dispatch, with_keyset))),
+                  register_or_verify());
+              python_registrations_.withLock([&](auto& regs) {
+                regs[lib._resolve(name)].insert_or_assign(
+                    dispatch,
+                    std::make_shared<c10::SafePyObject>(
+                        func.release().ptr(), getPyInterpreter()));
+              });
+            }
+            END_HANDLE_TH_ERRORS_PYBIND
+          },
+
+class PythonKernelHolder : public c10::OperatorKernel {
+  void operator()(
+      const c10::OperatorHandle& op,
+      c10::DispatchKeySet keyset,
+      torch::jit::Stack* stack) {
+```
 
 ## function.py
 ```
@@ -866,7 +1390,7 @@ class saved_tensors_hooks:
 
 
 
-# compile
+## compile
 时间流程：
 ```
 Python
@@ -886,8 +1410,8 @@ Inductor
     └──生成 C++
 ```
 
-# cuda
-## memory
+## cuda
+### memory
 
 https://pytorch.org/memory_viz
 
@@ -897,13 +1421,13 @@ _dump_snapshot(file_name)
 _record_memory_history(enabled=None)
 ```
 
-# distributed
+## distributed
 
-## fsdp.fully_shard
+### fsdp.fully_shard
 Each call to fully_shard creates one communication group containing all parameters in the module that are not already assigned to a group from an earlier call on a submodule. Each group’s parameters are all-gathered together in one collective before forward, and their gradients are reduce-scattered together in one collective after backward. In forward, all-gathers run on a separate CUDA stream, so the next module’s all-gather can overlap with the current module’s forward compute. Each module’s pre-forward hook issues its own all-gather and waits for it to complete before running the module.
 
 mesh (Optional[DeviceMesh]) – This data parallel mesh defines the sharding and device. If 1D, then parameters are fully sharded across the 1D mesh (FSDP) with (Shard(0),) placement. If 2D, then parameters are sharded across the 1st dim and replicated across the 0th dim (HSDP) with (Replicate(), Shard(0)) placement. The mesh’s device type gives the device type used for communication; if a CUDA or CUDA-like device type, then we use the current device.
-## run
+### run
 
 node==机器，worker==进程(GPU)，job==模型实例
 
@@ -932,7 +1456,7 @@ comm backend：gloo，mpi，nccl，xccl，ucc. 数据传输
 torchrun will pass the --local-rank=<rank> argument to your script.
 ```
 
-# export
+## export
 ```
 Python
    │
@@ -942,18 +1466,351 @@ ExportedProgram
    │
 保存
 ```
-# library
 
-为 aten 命名空间下已存在的算子（如 aten::relu）替换 / 添加自定义实现
+
+## include
+### Aten
+#### core
+##### boxing
+###### BoxedKernel_impl.h
 ```
-    _batch_invariant_LIB = torch.library.Library("aten", "IMPL")
-    _batch_invariant_LIB.impl("aten::mm", mm_batch_invariant, dispatch_key)
+template <class KernelFunctor>
+inline BoxedKernel BoxedKernel::makeFromFunctor(
+    std::unique_ptr<KernelFunctor> kernelFunctor) {
+  return BoxedKernel(
+      std::move(kernelFunctor),
+      [](OperatorKernel* kernel,
+         const OperatorHandle& op,
+         DispatchKeySet ks,
+         Stack* stack) {
+        (*static_cast<KernelFunctor*>(kernel))(op, ks, stack);
+      });
+}
+```
+###### KernelFunction.h
+```
+class TORCH_API KernelFunction final {
+  BoxedKernel boxed_kernel_func_;
+
+```
+###### KernelFunction_impl.h
+```
+
+inline KernelFunction KernelFunction::makeFromBoxedKernel(
+    BoxedKernel boxed_fn) {
+  return KernelFunction(
+      std::move(boxed_fn), nullptr); // no unboxed function pointer
+}
+
+inline KernelFunction::KernelFunction(
+    BoxedKernel boxed_fn,
+    void* unboxed_kernel_func,
+    void* sym_unboxed_kernel_func = nullptr)
+    : boxed_kernel_func_(std::move(boxed_fn)),
+      unboxed_kernel_func_(unboxed_kernel_func),
+      sym_unboxed_kernel_func_(sym_unboxed_kernel_func) {}
+```
+##### dispatch
+###### DispatchKeyExtractor.h
+
+```
+struct TORCH_API DispatchKeyExtractor final {
+  DispatchKeySet nonFallthroughKeys_;
+  std::array<DispatchKeySet, num_backends> nonFallthroughKeysPerBackend_;
+
+  static DispatchKeyExtractor makeUninitialized() {
+    return DispatchKeyExtractor(c10::utils::bitset());
+  }
+  explicit DispatchKeyExtractor(c10::utils::bitset dispatch_arg_indices_reverse)
+      : dispatch_arg_indices_reverse_(dispatch_arg_indices_reverse),
+#参与dispatch的参数位置
+        nonFallthroughKeys_(DispatchKeySet::FULL) {
+#所有 DispatchKey 都不是 fallthrough
+    for (const auto i : c10::irange(nonFallthroughKeysPerBackend_.size())) {
+      nonFallthroughKeysPerBackend_[i] = DispatchKeySet::FULL;
+    }
+  }
+
+  void registerSchema(const FunctionSchema& schema) {
+    dispatch_arg_indices_reverse_ = makeBitsetForDispatchArgs(schema);
+  }
+  static c10::utils::bitset makeBitsetForDispatchArgs(
+      const FunctionSchema& schema) {
+    c10::utils::bitset dispatch_arg_indices_reverse;
+    for (const auto index : c10::irange(schema.arguments().size())) {
+      if (isDispatchType(*schema.arguments()[index].type())) {
+        dispatch_arg_indices_reverse.set(schema.arguments().size() - 1 - index);
+      }
+    }
+    return dispatch_arg_indices_reverse;
+  }
+  static bool isDispatchType(const Type& type) {
+    return type.isSubtypeOf(*TensorType::get()) ||
+        type.isSubtypeOf(*ListType::ofTensors()) ||
+        type.isSubtypeOf(*ListType::ofOptionalTensors()) ||
+        type.isSubtypeOf(*OptionalType::ofTensor());
 
 ```
 
-# nn
+### c10
+#### core
+##### DispatchKey.h
+基础key：一些需要与backend组合才能用于dispatch，一些不用
 
-## module
+包含基础和复合
+```
+constexpr uint8_t num_functionality_keys =
+    static_cast<uint8_t>(DispatchKey::EndOfFunctionalityKeys);
+
+#define C10_FORALL_FUNCTIONALITY_KEYS(_) \
+  _(Dense, )                             \
+  _(Quantized, Quantized)                \
+  _(Sparse, Sparse)                      \
+  _(SparseCsr, SparseCsr)                \
+  _(NestedTensor, NestedTensor)          \
+  _(AutogradFunctionality, Autograd)
+
+
+enum class DispatchKey : uint16_t {
+  Undefined = 0,
+  CatchAll = Undefined,
+  ...
+  EndOfFunctionalityKeys, // End of functionality keys. //基础
+
+//自动生成 functionality 和 backend 的“笛卡尔积”
+
+#define DEFINE_PER_BACKEND_KEYS_FOR_BACKEND(n, prefix) prefix##n,
+
+#define DEFINE_PER_BACKEND_KEYS(fullname, prefix)      \
+  StartOf##fullname##Backends,                         \
+      C10_FORALL_BACKEND_COMPONENTS(                   \
+          DEFINE_PER_BACKEND_KEYS_FOR_BACKEND, prefix) \
+          EndOf##fullname##Backends = prefix##Meta,
+
+  C10_FORALL_FUNCTIONALITY_KEYS(DEFINE_PER_BACKEND_KEYS)
+
+      EndOfRuntimeBackendKeys = EndOfAutogradFunctionalityBackends, //复合
+    ...
+};
+
+
+constexpr uint8_t num_backends =
+    static_cast<uint8_t>(BackendComponent::EndOfBackendKeys);
+
+#define C10_FORALL_BACKEND_COMPONENTS(_, extra) \
+  _(CPU, extra)                                 \
+  _(CUDA, extra)                                \
+  _(HIP, extra)                                 \
+  _(XLA, extra)                                 \
+  _(MPS, extra)                                 \
+  _(IPU, extra)                                 \
+  _(XPU, extra)                                 \
+  _(HPU, extra)                                 \
+  _(VE, extra)                                  \
+  _(Lazy, extra)                                \
+  _(MTIA, extra)                                \
+  _(MAIA, extra)                                \
+  _(PrivateUse1, extra)                         \
+  _(PrivateUse2, extra)                         \
+  _(PrivateUse3, extra)                         \
+  _(Meta, extra)
+
+enum class BackendComponent : uint8_t {
+  InvalidBit = 0,
+#define DEFINE_BACKEND_COMPONENT(n, _) n##Bit,
+  C10_FORALL_BACKEND_COMPONENTS(DEFINE_BACKEND_COMPONENT, unused)
+#undef DEFINE_BACKEND_COMPONENT
+  EndOfBackendKeys = MetaBit,
+};
+
+class DispatchKeySet final {
+//根据dispatchkey生成dispatchset
+  constexpr explicit DispatchKeySet(DispatchKey k) {
+    if (k == DispatchKey::Undefined) {
+      // Case 1: handle Undefined specifically
+      repr_ = 0;
+
+//根据dispatchkeyset下标生成dispatchkey
+constexpr DispatchKey toRuntimePerBackendFunctionalityKey(
+    DispatchKey functionality_k,
+    BackendComponent backend_k) {
+  if (functionality_k == DispatchKey::Dense) {
+    return static_cast<DispatchKey>(
+        static_cast<uint8_t>(DispatchKey::StartOfDenseBackends) +
+        static_cast<uint8_t>(backend_k));
+  }
+
+//需要复合的基础functionality不占位
+constexpr uint16_t num_runtime_entries = num_functionality_keys +
+    (numPerBackendFunctionalityKeys() * (num_backends - 1));
+
+```
+##### DispatchKeySet.h
+低位：backend bits
+
+高位：functionality bits（基础）
+
+存储所有可能的dispatchkey
+```
+class DispatchKeySet final {
+  constexpr DispatchKeySet(Full /*unused*/)
+      : repr_((1ULL << (num_backends + num_functionality_keys - 1)) - 1) {}
+//EndOfFunctionalityKeys也占1位，要减去，backend没有
+  iterator begin() const {
+    return iterator(&repr_);
+  }
+  class iterator {
+    explicit iterator(
+        const uint64_t* data_ptr,
+        uint8_t next_functionality = num_backends,
+        uint8_t next_backend = 0)
+        : data_ptr_(data_ptr),
+          next_functionality_(next_functionality),
+          next_backend_(next_backend) {
+      ++(*this);
+    }
+
+    DispatchKey operator*() const {
+      auto functionality_key =
+          static_cast<DispatchKey>(current_dispatchkey_idx_);//在dispatchkey里面的索引
+      if (isPerBackendFunctionalityKey(functionality_key)) {
+        auto next_key = toRuntimePerBackendFunctionalityKey(
+            functionality_key,
+            static_cast<BackendComponent>(current_backendcomponent_idx_));
+        return next_key;
+      } else {
+        return functionality_key;
+      }
+    }
+
+//bit越高，优先级越高？
+    int getDispatchTableIndexForDispatchKeySet() const {
+        auto functionality_idx =
+            DispatchKeySet(repr_ >> num_backends).indexOfHighestBit();
+//找最高1，基础dispatchkey
+        auto offset_and_mask = offsetsAndMasks()[functionality_idx];
+//dispatchkey在表里的下标
+        auto backend_idx =
+            DispatchKeySet((repr_ & offset_and_mask.mask) >> 1).indexOfHighestBit();
+        return offset_and_mask.offset + backend_idx;
+    }
+
+inline int getDispatchTableIndexForDispatchKey(DispatchKey k) {
+  return DispatchKeySet(k).getDispatchTableIndexForDispatchKeySet();
+}
+
+C10_ALWAYS_INLINE static const std::
+    array<FunctionalityOffsetAndMask, num_functionality_keys>&
+    offsetsAndMasks() {
+  static auto offsets_and_masks_ = initializeFunctionalityOffsetsAndMasks();
+  return offsets_and_masks_;
+}
+```
+## library.h
+
+```
+class TORCH_API Library final {
+  std::vector<c10::RegistrationHandleRAII> registrars_;
+  Library& def(
+      c10::FunctionSchema&& s,
+      const std::vector<at::Tag>& tags = {},
+      _RegisterOrVerify rv = _RegisterOrVerify::REGISTER) & {
+    return _def(std::move(s), nullptr, tags, rv);
+  }
+  template <typename Name, typename Func>
+  Library& impl(
+      Name name,
+      Func&& raw_f,
+      _RegisterOrVerify rv = _RegisterOrVerify::REGISTER) & {
+    CppFunction f(std::forward<Func>(raw_f));
+#endif
+    return _impl(name, std::move(f), rv);
+  }
+
+class TORCH_API CppFunction final {
+  template <class KernelFunctor>
+  static CppFunction makeFromBoxedFunctor(
+      std::unique_ptr<KernelFunctor> kernelFunctor) {
+    return makeFromBoxedKernel(
+        c10::BoxedKernel::makeFromFunctor(std::move(kernelFunctor)));
+  static CppFunction makeFromBoxedKernel(c10::BoxedKernel kernel) {
+    return CppFunction(
+        c10::KernelFunction::makeFromBoxedKernel(std::move(kernel)),
+        /* cpp_signature */ std::nullopt, // not known for boxed functions
+        /* schema */ nullptr);
+  }
+  std::optional<c10::DispatchKey> dispatch_key_;
+
+inline CppFunction dispatch(c10::DispatchKey k, Func&& raw_f) {
+  CppFunction f(std::forward<Func>(raw_f));
+  if (k == c10::DispatchKey::CatchAll) {
+    f.dispatch_key_ = std::nullopt;
+  } else {
+    f.dispatch_key_ = k;
+  }
+  return f;
+}
+
+```
+## library.py
+实现、替换原有算子
+
+注册lib、op签名、kernel到dispatcher
+
+计算？？？
+```
+class Library:
+    def __init__(self, ns, kind, dispatch_key=""):
+        filename, lineno = f.f_code.co_filename, f.f_lineno
+        self.m: Any | None = torch._C._dispatch_library(
+            kind, ns, dispatch_key, filename, lineno
+        )
+        self.ns = ns
+        self._op_defs: set[str] = set()
+        self._op_impls: set[str] = set()
+        self._registration_handles: list[torch._library.utils.RegistrationHandle] = []
+        self.kind = kind
+        self.dispatch_key = dispatch_key
+        weakref.finalize(
+            self,
+            _del_library,
+    def define(self, schema, alias_analysis="", *, tags=()):
+        result = self.m.define(schema, alias_analysis, tuple(tags))
+        qualname = self.ns + "::" + name
+        self._op_defs.add(qualname)
+        _defs.add(qualname)
+    def impl(
+        self, op_name, fn, dispatch_key="", *, with_keyset=False, allow_override=True
+    ):
+        key = self.ns + "/" + name.split("::")[-1] + "/" + dispatch_key
+        self.m.impl(
+            name,
+            dispatch_key if dispatch_key != "" else "CompositeImplicitAutograd",
+            fn,
+            with_keyset,
+        )
+        _impls.add(key)
+        self._op_impls.add(key)
+
+        
+@functools.singledispatch
+def impl(
+    return _impl(qualname, types, func, lib=lib, disable_dynamo=False)
+
+@impl.register
+def _(
+    lib: Library, name: str, dispatch_key: str = ""
+) -> Callable[[Callable[_P, _T]], Callable[_P, _T]]:
+
+    def wrap(f: Callable[_P, _T]) -> Callable[_P, _T]:
+        lib.impl(name, f, dispatch_key)
+        return f
+
+    return wrap
+```
+## nn
+
+### module
 
 ```
 class Module:
@@ -1080,7 +1937,7 @@ class Module:
 <class 'torch.Tensor'>
 ```
 
-# profiler
+## profiler
 
 timeline:
 
@@ -1107,7 +1964,7 @@ schedule(wait,warmup,active,repeat)
 ```
 active结束调用一次on_trace_ready，step一次表示走完一步
 
-# Tensor
+## Tensor
 
 ```
 next_functions = [
@@ -1126,11 +1983,17 @@ items(): D2H+sync
 
 view: Returns a new tensor with the same data as the self tensor but of a different shape.
 
-# utils
-## _python_dispatch.py
+## utils
+### _python_dispatch.py
 
 ```
 def _push_mode(mode: TorchDispatchMode) -> None:
+    k = mode._dispatch_key if hasattr(mode, "_dispatch_key") else None
+    if k is not None and k != torch._C.DispatchKey.PreDispatch:
+        raise AssertionError(
+            "mode._dispatch_key must be None or DispatchKey.PreDispatch"
+        )
+    if k is None:
         _push_on_torch_dispatch_stack(mode)
 
 
@@ -1183,6 +2046,10 @@ loss.backward()
 _CheckpointFrame保存checkpoint输入tensor，前向save_tensor不保存任何tensor，save_op保存输出
 
 反向一开始就执行整个checkpoint的前向，_CheckpointFrame保存反向需要的tensor，recompute_op计算，TorchDispatchMode返回输出
+
+如果checkpoint里面所有算子都不需要save_tensor的话，没有hook调用，没有frame引用，不会保存输入，不会重算，比如torch.add
+
+旧版重算会进policy
 ```
 new_frame.save_inputs(*args)保存输入tensor
 _checkpoint_hook.__enter__给设置save_tensor_hooks
@@ -1371,4 +2238,4 @@ class RemovableHandle:
         if hooks_dict is not None and self.id in hooks_dict:
             del hooks_dict[self.id]
 ```
-
+register_full_backward_pre_hook

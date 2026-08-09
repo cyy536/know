@@ -1492,7 +1492,22 @@ print("解析后的类型：", type_hints["sequence_parallel_nccl_config"])
 
 ## functools
 
-@lru_cache 对函数的返回值进行缓存。相同参数再次调用时，直接返回之前计算的结果，不重新执行函数。
+@functools.lru_cache 对函数的返回值进行缓存。相同参数再次调用时，直接返回之前计算的结果，不重新执行函数。
+
+@functools.singledispatch 根据第一个参数的类型，选择不同的函数实现。
+```
+@functools.singledispatch
+def show(value):
+    print("默认实现:", value)
+
+@show.register
+def _(value: int):
+    print("整数实现:", value)
+
+@show.register
+def _(value: str):
+    print("字符串实现:", value)
+```
 
 ## logging
 
@@ -1752,7 +1767,13 @@ union_type = Union[int, str]
 print(union_type.__origin__) # typing.Union
 print(union_type.__args__)   # (<class 'int'>, <class 'str'>)（Union包含的所有类型）
 ```
-
+## weakref
+当 obj 不再可达并被垃圾回收时，会执行_del_library
+```
+weakref.finalize(
+    self,
+    _del_library,
+```
 # shellscript
 
 Shell 所有变量都是字符串
