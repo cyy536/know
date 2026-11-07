@@ -14,8 +14,8 @@ Jetson：边缘 AI/机器人/嵌入式
 
 按微架构发布时间排序
 ```
-pascal-6:1080ti,Tesla p100
-volta-7:Tesla v100
+pascal-6:1080ti,Tesla p100(nvlink)
+volta-7:Tesla v100(tensor core)
 turing-7.5:2080ti,T4
 ampere-8:a100,a800,a30
       -8.6:3090,RTX A6000
@@ -49,9 +49,9 @@ HGX baseboard：
 
 HGX (Hyperscale Graphics eXtension) 是 NVIDIA 提供给厂商集成的 GPU 服务器平台。DGX 是 NVIDIA 自己卖的完整 AI 服务器产品。
 
-gh200=h200+grace cpu
+gh200=h200+NVLink-C2C+grace cpu
 
-gb200=2*b200+grace cpu
+gb200=2*b200+NVLink-C2C+grace cpu
 
 ```
 GB200 NVL72 Rack
@@ -85,7 +85,7 @@ FP4   -> Blackwell
 ```
 fp32:1+8+23
 fp16:1+5+10，不能表示太小的值，梯度溢出，要放大loss
-bf16:1+8+7，精度低
+bf16:1+8+7，精度低，主流
 fp8:1+4+3,1+5+2
 ```
 
@@ -103,59 +103,83 @@ nvidia-smi topo -m
 
 全双工，NVLink3单向带宽25GB/s
 
-
 # cuda
 
-硬件层级：GPU -> GPC -> SM -> warp -> thread
-
-任务层级: grid -> cluster -> block/CTA -> cta_tile -> hmma_tile -> tensor_core_tile
-
-一个 kernel 启动后，grid 里的 block 会被调度到各个 SM。只有当某个 block 需要的资源满足 SM 限制时，它才能成为该 SM 上的 resident block。没有被分配到 SM 的 block 会等待，直到有 SM 资源释放。一个 SM 可以同时驻留多个 block，只要资源够。如果单个 block 的资源需求超过单个 SM 能力，那么这个 kernel 无法合法启动。
-
-SM 以 warp 为单元调度执行，可并发、并行执行多个 warp。这个切换基本没有 CPU 那种上下文切换开销，因为 warp 的寄存器状态已经常驻在 SM 上。
-
 ```
-每个 SM 有:
-  register file
-  shared memory
-  L1 / texture cache
+硬件组织（简化）：
+GPU → GPC → SM
 
-整个 GPU 共享:
-  L2 cache
-  global memory
+CUDA 线程组织：
+grid → [可选 cluster] → block/CTA → warp → thread。
 ```
-H100 combined L1 + texture + shared memory = 256 KB / SM。H100 可配置 shared memory 容量最高 = 228 KB / SM
+
+整个 GPU 共享: L2 cache、global memory
+
+对于同一条 global memory 访存指令，硬件会合并同一个 warp 内活跃线程的访问。在计算能力 6.0 及以上的常见访问模型中，按覆盖所需地址的 32B 对齐段（sector）形成请求。未被使用的段内字节也会被一起获取，通常存进 L1／L2 缓存。
+```
+起始地址按 32B 对齐：128B 数据 → 覆盖 4 个 32B 段
+起始地址偏移一个 float：       → 覆盖 5 个 32B 段
+```
+
+SM 内包含 warp scheduler、CUDA Core、Tensor Core、TMA（Hopper）、TMEM（blackwell）、寄存器、shared memory / L1 / texture cache 等资源。
+
+SM 以 warp 为单元调度执行，可并发、并行执行多个 warp。这个切换基本没有 CPU 那种上下文切换开销，因为 warp 的寄存器状态已经常驻在 SM 上。同一个 SM 可以同时驻留来自不同 kernel 的 block，并调度它们的 warp 执行。
 
 register 放不下产生 spill 时，会 spill 到 local memory。local memory 物理上在 global memory 中，可能经过 L1/L2 cache。
 
-shared memory 通常划分为 32 个 bank。
-常见模式下每个 bank 每周期服务 32b。
-如果一个 warp 内多个线程访问同一个 bank 的不同地址，会发生 bank conflict，需要序列化。
-如果多个线程访问同一个地址，可能走 broadcast，不一定冲突。
+Shared memory 通常划分为 32 个 bank。在常见的 32-bit bank 模式下，连续的 32-bit 字映射到连续的 bank。对同一个 warp 的一次 shared memory 访问请求，如果多个线程需要访问同一个 bank 中的不同 32-bit 字，会产生 bank conflict，需要分多轮服务。多个线程读取同一个 32-bit 字时，可以通过 broadcast 满足。
 
-global memory 访问会按 warp 合并。现代 CUDA 架构通常以 32B 为基本内存事务单位。
+Thread Block Cluster 是 Hopper（计算能力 9.0）引入的一个可选 CUDA 线程组织层级，由grid 坐标上相邻的一组 block组成。这些 block 保证被共同调度到同一个 GPC 内的一组 SM 上，硬件会为整个 cluster 安排共同驻留所需的资源，保证这些 block 都能执行。
+Cluster 支持通过 cluster.sync() 进行 cluster 级同步，并通过 Distributed Shared Memory（DSM） 对同一 cluster 内其他 block 的 shared memory 执行读、写和原子操作。每个 block 仍拥有独立的 shared memory；跨 block 访问需要完成必要的初始化和同步，并保证相关 block 在访问结束前不能退出。
 
 ```
-Tensor Core 操作通常由整个 warp 协作完成。
-mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 是 warp-level synchronous 操作。
-同一个 warp 内所有参与线程必须以一致方式调用，否则行为未定义。
-线程会等待该 MMA 操作完成后继续。
+Tensor Core GEMM：
+CTA tile = (BM, BN, BK)
+BM×BN：CTA 负责累加的输出块大小
+BK：每轮主循环沿 K 维处理的长度
 
-Hopper 引入 WGMMA。
-一个 warp group = 4 个 warp = 128 个线程，通常来自同一个 SM 中连续的 warps。
-wgmma.mma_async 是 warp-group 级别的异步矩阵乘操作。
+使用 mma.sync.aligned 时，CTA 的输出块可以进一步分给多个 warp，每个 warp 负责其中的 warp tile，再通过多条 MMA 指令完成计算。
+一个 CTA 计算 64×64 输出块，可以安排 4 个 warp，各自计算一个 32×32 区域。使用 m16n8k16 时，每个 warp 在处理一段长度为 16 的 K 维时需要
+for (k = 0; k < K; k += 16) {
+    for (m = 0; m < 32; m += 16) {
+        for (n = 0; n < 32; n += 8) {
+            mma_sync(..., acc[m][n]);
+        }
+    }
+}
 
-TMA = Tensor Memory Accelerator。
-Hopper 引入，用于 global memory <-> shared memory 的大块、多维 tensor 异步搬运。也支持 cluster 内 shared memory 之间的搬运。
-通常由少量线程，甚至一个线程，发起 TMA copy。
-TMA 避免让整个 warp 手写地址计算和循环搬运，减少寄存器和指令开销。
+每条 mma.sync.aligned 都由一个 warp 的 32 个线程共同执行。.sync 要求线程等待 warp 内其他线程执行同一条指令；.aligned 要求整个 warp 一致参与。独立的后续指令可以与计算流水重叠；使用结果的指令，其依赖由编译器生成的代码和硬件调度机制保证，无需额外的计算完成等待指令
 
-WGMMA 和 TMA 都被设计成异步操作。
-发起后线程可以执行其它不依赖结果的任务；
-但在消费 WGMMA 结果或 TMA 搬运的数据前，必须显式等待/同步。
+Hopper 引入了 WGMMA，由一个 warp group 协作计算相应的输出块，可以称为 warp-group tile。一个 warp group 包含同一个 CTA 内连续的 4 个 warp，共 128 个线程，起始 warp 编号必须是 4 的倍数，例如 warp 0～3、4～7。
+wgmma.mma_async.sync.aligned...
+mma_async 表示计算的发起与完成分离。程序可以继续执行独立工作，但普通指令访问尚未等待完成的累加器属于未定义行为，不能依靠普通寄存器依赖机制自动等待。
 
-cluster 是 Hopper 引入的一个新的 CUDA 线程层级。cluster 是一组 block。这些 block 会被保证同时调度到同一个 GPU Processing Cluster 的一组 SM 上，从而可以做更强的协作。支持 cluster-level synchronization，访问彼此的 distributed shared memory。
+| 数据 | `mma.sync` | Hopper WGMMA |
+|---|---|---|
+| A 输入 | 寄存器 | 寄存器或 shared memory |
+| B 输入 | 寄存器 | shared memory |
+| 累加结果 | 寄存器 | 寄存器 |
+
+Blackwell（以 SM100 的 B200／GB200 为例）进一步引入 tcgen05.mma：
+- 一个线程即可发起整次矩阵运算，计算本身仍由 Tensor Core 完成。
+- A 输入可以位于 shared memory 或 TMEM，B 输入位于 shared memory。
+- 累加结果存放在 TMEM，减少普通寄存器的累加器占用。
+- 计算异步完成，需要使用对应的完成通知和同步机制。
+- 支持单 CTA 模式和两个 CTA 协作的模式
+FP16/BF16 的一种合法双 CTA 指令形状是 256×256×16
+TMEM 是独立于寄存器和 shared memory 的专用片上存储，也不属于 HBM。
 ```
+
+TMA 支持异步批量搬运数据。以 global memory → shared memory 的多维 tensor copy 为例：
+```
+准备 tensor descriptor，描述张量的形状、步长和布局
+→ 通常由一个线程指定数据块并发起 TMA copy
+→ 硬件异步完成地址计算和数据搬运
+→ 线程可以继续执行不依赖该数据的工作
+→ 消费者等待 barrier 确认搬运完成
+→ 消费者读取 shared memory 中的数据
+```
+TMA 也支持同一个 cluster 内，不同 CTA 的 shared memory 之间的异步批量搬运。这类搬运使用 cp.async.bulk，通过源地址、目标地址和字节数描述连续数据，不需要 tensor descriptor；消费者同样需要通过相应的 barrier 等待搬运完成后再读取。
 
 ## api
 

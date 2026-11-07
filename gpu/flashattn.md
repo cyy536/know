@@ -1,5 +1,8 @@
 ```
 docker run -itd --ipc host --net host --gpus all --name cyy_fa -v ~/flashattn:/flashattn pytorch/pytorch:2.7.1-cuda12.8-cudnn9-devel bash
+
+pip show flash_attn
+pip show flash_attn_4
 ```
 # v1
 
